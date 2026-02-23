@@ -18,6 +18,7 @@ __all__ = [
     'Exclude', 'Pin', 'MinimumTrials', 'ExactlyK',
     'AtMostKInARow', 'AtLeastKInARow',
     'ExactlyKInARow', 'ContinuousConstraint',
+    'ExhaustLevelsInOrder',
 
     'Gen', 'RandomGen', 'IterateSATGen',
     'CMSGen', 'UniGen', 'IterateILPGen',
@@ -45,7 +46,7 @@ from sweetpea._internal.constraint import (
     Consistency, Constraint, Derivation,
     Exclude, Pin, MinimumTrials,
     ExactlyK, AtMostKInARow, AtLeastKInARow, ExactlyKInARow,
-    ContinuousConstraint
+    ContinuousConstraint, ExhaustLevelsInOrder
 )
 from sweetpea._internal.sampling_strategy.base import Gen
 from sweetpea._internal.sampling_strategy.uniform import UniformGen
