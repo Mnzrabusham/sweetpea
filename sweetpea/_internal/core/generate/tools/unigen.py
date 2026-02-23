@@ -29,6 +29,13 @@ try:
 except ImportError:
     HAS_PYUNIGEN = False
 
+# Try to import pycmsgen for Python-based near-uniform sampling
+try:
+    import pycmsgen
+    HAS_PYCMSGEN = True
+except ImportError:
+    HAS_PYCMSGEN = False
+
 
 class UnigenError(ToolError):
     """An error raised when Unigen fails."""
@@ -137,6 +144,60 @@ def call_unigen_python(input_file: Path, sample_count: int) -> str:
         raise UnigenError(-1, str(e), f"pyunigen sampling failed: {e}")
 
 
+def call_cmsgen_python(input_file: Path, sample_count: int) -> str:
+    """Calls pycmsgen library for near-uniform sampling (Python-based, no binary needed).
+
+    Unlike pyunigen which returns multiple samples in one call, pycmsgen only
+    returns one sample per solve() call. To collect multiple samples, we create
+    a new Solver with a different random seed for each sample.
+
+    Args:
+        input_file: CNF file to sample from
+        sample_count: Number of samples requested.
+
+    Returns:
+        Formatted sample output string matching CMSGen binary format
+    """
+    if not HAS_PYCMSGEN:
+        raise ImportError("pycmsgen not available")
+
+    clauses, sampling_set, num_vars = parse_cnf_file(input_file)
+
+    if not clauses:
+        return ""
+
+    if not sampling_set:
+        sampling_set = list(range(1, num_vars + 1))
+
+    try:
+        output_lines = []
+        for i in range(sample_count):
+            seed = random.randint(999999999)
+            solver = pycmsgen.Solver(seed=int(seed))
+            for clause in clauses:
+                solver.add_clause(clause)
+
+            sat, solution = solver.solve()
+
+            if not sat:
+                return ""
+
+            sample_lits = []
+            for var in sampling_set:
+                if var < len(solution) and solution[var]:
+                    sample_lits.append(str(var))
+                else:
+                    sample_lits.append(str(-var))
+
+            sample_str = "v " + " ".join(sample_lits) + " 0"
+            output_lines.append(sample_str)
+
+        return "\n".join(output_lines) + "\n"
+
+    except Exception as e:
+        raise UnigenError(-1, str(e), f"pycmsgen sampling failed: {e}")
+
+
 def call_unigen_docker(input_file: Path, sample_count: int) -> Tuple[CompletedProcess, str]:
     """Calls Unigen in a Docker container, reading a given file as the input problem."""
     unigen_container = 'msoos/unigen'
@@ -157,9 +218,8 @@ def call_unigen_cli(input_file: Path,
     to a local directory from the `sweetpea-org/unigen-exe repository
     <https://github.com/sweetpea-org/unigen-exe>`_.
     
-    Note: CMSGen currently only supports binary/Docker modes. There is no Python
-    library equivalent for CMSGen sampling (pycmsgen is just a SAT solver wrapper,
-    not a sampler).
+    Note: The preferred mode for both UniGen and CMSGen is Python library mode.
+    This CLI function is used as a fallback when the Python libraries are unavailable.
     """
     unigen_exe = CMSGEN_EXE if use_cmsgen else UNIGEN_EXE
     ensure_executable_available(unigen_exe, download_if_missing)
@@ -187,15 +247,12 @@ def call_unigen(sample_count: int,
                 ) -> str:
     """Calls Unigen or CMSGen with the given file as input.
 
-    If ``use_python`` is ``True`` and pyunigen is installed, this will use
-    the Python-based pyunigen library for UniGen (recommended for Windows).
-    
-    Note: CMSGen currently only supports binary/Docker modes. The pycmsgen
-    package is just a SAT solver wrapper and does not provide sampling
-    functionality, so Python mode is not available for CMSGen.
-    
+    If ``use_python`` is ``True`` and the appropriate Python library is installed
+    (pyunigen for UniGen, pycmsgen for CMSGen), this will use the Python-based
+    library (recommended for Windows).
+
     If ``use_cmsgen`` is ``True``, CMSGen sampler is used instead of UniGen.
-    
+
     If ``docker_mode`` is ``True``, this will use a Docker container to run
     Unigen/CMSGen. If it's ``False``, a command-line executable will be used.
 
@@ -204,20 +261,33 @@ def call_unigen(sample_count: int,
     will be automatically downloaded if it's missing.
     """
     # Priority for UniGen: Python → Docker → Binary
-    # Priority for CMSGen: Docker → Binary
-    
-    if use_python and not docker_mode and not use_cmsgen:
-        if HAS_PYUNIGEN:
-            try:
-                return call_unigen_python(input_file, sample_count)
-            except ImportError:
-                pass
-            except Exception as e:
-                warnings.warn(
-                    f"pyunigen failed ({e}), falling back to binary",
-                    UserWarning,
-                    stacklevel=2
-                )
+    # Priority for CMSGen: Python → Docker → Binary
+
+    if use_python and not docker_mode:
+        if use_cmsgen:
+            if HAS_PYCMSGEN:
+                try:
+                    return call_cmsgen_python(input_file, sample_count)
+                except ImportError:
+                    pass
+                except Exception as e:
+                    warnings.warn(
+                        f"pycmsgen failed ({e}), falling back to binary",
+                        UserWarning,
+                        stacklevel=2
+                    )
+        else:
+            if HAS_PYUNIGEN:
+                try:
+                    return call_unigen_python(input_file, sample_count)
+                except ImportError:
+                    pass
+                except Exception as e:
+                    warnings.warn(
+                        f"pyunigen failed ({e}), falling back to binary",
+                        UserWarning,
+                        stacklevel=2
+                    )
     
     # Fall back to Docker or binary
     if docker_mode:
@@ -250,13 +320,11 @@ SOLUTIONS:
    - x86: https://aka.ms/vs/17/release/vc_redist.x86.exe
 """
             else:
-                friendly_message += """1. Use Docker mode: Set docker_mode=True
-2. Install Visual C++ Redistributable 2015-2022:
+                friendly_message += """1. Use Python mode (recommended): pip install pycmsgen
+2. Use Docker mode: Set docker_mode=True
+3. Install Visual C++ Redistributable 2015-2022:
    - x64: https://aka.ms/vs/17/release/vc_redist.x64.exe
    - x86: https://aka.ms/vs/17/release/vc_redist.x86.exe
-
-Note: CMSGen has no Python library equivalent (pycmsgen is just a SAT solver,
-not a sampler). Binary or Docker mode is required for CMSGen.
 """
             raise UnigenError(result.returncode, stdout, friendly_message)
         

@@ -1234,6 +1234,211 @@ class ConstantInWindows(Constraint):
         return True
 
 
+class ExhaustLevelsInOrder(Constraint):
+    """Constraint that ensures all trials for one level of a factor are
+    completed before trials for the next level begin. The user must specify
+    the exact order in which levels are exhausted.
+
+    Usage::
+
+        ExhaustLevelsInOrder(factor, order=['level1', 'level2'])
+    """
+
+    def __init__(self, factor: Factor, order: List[str]):
+        who = "ExhaustLevelsInOrder"
+        if not isinstance(factor, Factor):
+            raise ValueError(f"{who}: expected a Factor, given {type(factor).__name__}")
+        self.factor = factor
+
+        if not isinstance(order, list) or len(order) == 0:
+            raise ValueError(f"{who}: order must be a non-empty list of level names")
+        self.order = order
+
+        level_names = [l.name for l in factor.levels]
+        for name in order:
+            if name not in level_names:
+                raise ValueError(
+                    f"{who}: '{name}' is not a level of factor '{factor.name}'. "
+                    f"Valid levels: {level_names}"
+                )
+        if len(order) != len(set(order)):
+            raise ValueError(f"{who}: order contains duplicate level names")
+        if set(order) != set(level_names):
+            raise ValueError(
+                f"{who}: order must include all levels of the factor. "
+                f"Missing: {set(level_names) - set(order)}"
+            )
+
+    def validate(self, block: Block) -> None:
+        validate_factor(block, self.factor)
+        if len(self.factor.levels) < 2:
+            raise ValueError(
+                "ExhaustLevelsInOrder: factor must have at least 2 levels"
+            )
+        if self.factor.has_complex_window:
+            raise ValueError(
+                "ExhaustLevelsInOrder: not supported for factors with complex windows "
+                "(transitions, etc.)"
+            )
+
+    def uses_factor(self, f: Factor) -> bool:
+        return self.factor.uses_factor(f)
+
+    def desugar(self, replacements: dict) -> List[Constraint]:
+        factor = replacements.get(self.factor, self.factor)
+        return [ExhaustLevelsInOrder(factor, self.order)]
+
+    def is_complex_for_combinatoric(self) -> bool:
+        return True
+
+    def apply(self, block: Block, backend_request: BackendRequest) -> None:
+        ordered_levels = [self.factor.get_level(name) for name in self.order]
+        self._apply_ordered(block, backend_request, ordered_levels)
+        # NOTE: Contiguous/random-order mode commented out for now.
+        # To re-enable, make `order` optional and uncomment:
+        # if self.order is not None:
+        #     ordered_levels = [self.factor.get_level(name) for name in self.order]
+        #     self._apply_ordered(block, backend_request, ordered_levels)
+        # else:
+        #     self._apply_contiguous(block, backend_request)
+
+    def _apply_ordered(self, block: Block, backend_request: BackendRequest,
+                       ordered_levels: list) -> None:
+        """Ordered encoding using switch/boundary auxiliary variables.
+
+        For each consecutive pair (Li, Li+1), introduce N fresh switch variables
+        s_t meaning 'transition from Li to Li+1 has happened by trial t'.
+        """
+        N = block.trials_per_sample()
+        clauses: List[Any] = []
+
+        for pair_idx in range(len(ordered_levels) - 1):
+            level_before = ordered_levels[pair_idx]
+            level_after = ordered_levels[pair_idx + 1]
+
+            # Allocate N fresh switch variables
+            s_vars = list(range(backend_request.fresh,
+                                backend_request.fresh + N))
+            backend_request.fresh += N
+
+            for t in range(N):
+                trial = t + 1  # 1-based 
+                var_li = block.get_variable(trial, (self.factor, level_before))
+                var_li1 = block.get_variable(trial, (self.factor, level_after))
+                s_t = s_vars[t]
+
+                # Monotonic: once switched, stays switched
+                if t < N - 1:
+                    clauses.append(Or([-s_t, s_vars[t + 1]]))
+
+                # Li+1 only after switch
+                clauses.append(Or([s_t, -var_li1]))
+
+                # Li only before switch
+                clauses.append(Or([-s_t, -var_li]))
+
+        if clauses:
+            backend_request.cnfs.append(And(clauses))
+
+    # NOTE: _apply_contiguous is commented out. It implements random-order mode
+    # where the solver picks level ordering but enforces contiguity.
+    #
+    # def _apply_contiguous(self, block: Block, backend_request: BackendRequest) -> None:
+    #     """Contiguity encoding: each level's appearances form a contiguous block.
+    #
+    #     For each level, introduce 'started' and 'past' auxiliary variables
+    #     to prevent gaps in a level's appearances.
+    #     """
+    #     N = block.trials_per_sample()
+    #     clauses: List[Any] = []
+    #
+    #     for level in self.factor.levels:
+    #         # Allocate 2*N fresh variables: started_1..N and past_1..N
+    #         started_vars = list(range(backend_request.fresh,
+    #                                   backend_request.fresh + N))
+    #         backend_request.fresh += N
+    #         past_vars = list(range(backend_request.fresh,
+    #                                backend_request.fresh + N))
+    #         backend_request.fresh += N
+    #
+    #         for t in range(N):
+    #             trial = t + 1  # 1-based
+    #             var_l = block.get_variable(trial, (self.factor, level))
+    #             started_t = started_vars[t]
+    #             past_t = past_vars[t]
+    #
+    #             # started is monotonic
+    #             if t < N - 1:
+    #                 clauses.append(Or([-started_t, started_vars[t + 1]]))
+    #
+    #             # If L appears, mark started
+    #             clauses.append(Or([-var_l, started_t]))
+    #
+    #             # If started and L absent, mark past
+    #             clauses.append(Or([-started_t, var_l, past_t]))
+    #
+    #             # past is monotonic
+    #             if t < N - 1:
+    #                 clauses.append(Or([-past_t, past_vars[t + 1]]))
+    #
+    #             # L cannot appear once past
+    #             clauses.append(Or([-past_t, -var_l]))
+    #
+    #     if clauses:
+    #         backend_request.cnfs.append(And(clauses))
+
+    def potential_sample_conforms(self, sample: dict, block: Block) -> bool:
+        seq = _series_for(sample, self.factor)
+
+        # Check that the order of level blocks matches the specified order
+        observed_order: List[str] = []
+        for trial_val in seq:
+            name = _val_name(trial_val)
+            if not observed_order or observed_order[-1] != name:
+                observed_order.append(name)
+
+        # observed_order must be a subsequence of self.order
+        order_idx = 0
+        for name in observed_order:
+            while order_idx < len(self.order) and self.order[order_idx] != name:
+                order_idx += 1
+            if order_idx >= len(self.order):
+                return False
+            order_idx += 1
+
+        return True
+
+        # NOTE: Contiguity-only check for random-order mode commented out.
+        # To re-enable, make order optional and uncomment:
+        # if not self._check_contiguous(seq):
+        #     return False
+
+    # NOTE: _check_contiguous is commented out (used by random-order mode).
+    #
+    # @staticmethod
+    # def _check_contiguous(seq) -> bool:
+    #     """Check that each level's appearances form a contiguous block."""
+    #     finished_levels: set = set()
+    #     prev_name = None
+    #     for trial_val in seq:
+    #         name = _val_name(trial_val)
+    #         if name != prev_name:
+    #             if name in finished_levels:
+    #                 return False
+    #             if prev_name is not None:
+    #                 finished_levels.add(prev_name)
+    #         prev_name = name
+    #     return True
+
+    def __eq__(self, other):
+        return (isinstance(other, ExhaustLevelsInOrder) and
+                self.factor == other.factor and
+                self.order == other.order)
+
+    def __repr__(self):
+        return f"ExhaustLevelsInOrder({self.factor.name}, order={self.order})"
+
+
 def _series_for(sample: dict, factor: Factor):
     # Try Factor object key
     if factor in sample:
