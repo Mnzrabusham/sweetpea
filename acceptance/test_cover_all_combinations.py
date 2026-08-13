@@ -222,7 +222,7 @@ def test_k_lower_bound_tight_for_stroop(n, expected_k):
     # matching scan does a single confirming check.
     _, color, word, _, inner = _stroop(n)
     cac = CoverAllCombinations(color, word)
-    (_, _, R_free, slots, _, sw, _) = cac._coverage_analysis(inner)
+    (_, _, R_free, slots, _, sw, _) = cac._coverage_analysis(inner, [color, word])
     assert cac._k_lower_bound(R_free, slots, sw) == expected_k
     assert cac.required_instances(inner) == expected_k
 
@@ -289,6 +289,201 @@ def test_unmodeled_conflict_yields_hint(capsys):
     out = capsys.readouterr().out
     assert 'CoverAllCombinations' in out
     assert 'AtLeastKInARow' in out
+
+
+# ~~~~~~~~~~~~ Coverage/trials tradeoff (prioritize) ~~~~~~~~~~~~
+
+def _trio():
+    """`task` is crossed while colr, size, and cue ride free, so covering all
+    three together is what drives the trial count: 2*2*3 = 12 combinations over
+    2 free slots per pass, hence 12 trials."""
+    colr = Factor('colr', ['red', 'green'])
+    size = Factor('size', ['big', 'small'])
+    cue = Factor('cue', ['c1', 'c2', 'c3'])
+    task = Factor('task', ['A', 'B'])
+    return colr, size, cue, task
+
+
+def _trio_block(colr, size, cue, task, listed=None, **kw):
+    listed = listed if listed is not None else [colr, size, cue]
+    return CrossBlock(design=[task, colr, size, cue], crossing=[task],
+                      constraints=[CoverAllCombinations(*listed, **kw)])
+
+
+class _Answers:
+    """Stands in for `input`, replaying scripted answers and recording the
+    prompts it was asked."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.prompts = []
+
+    def __call__(self, prompt=''):
+        self.prompts.append(prompt)
+        if not self.answers:
+            raise AssertionError('unexpected extra prompt: {}'.format(prompt))
+        return self.answers.pop(0)
+
+
+@pytest.mark.parametrize('kw', [{}, {'prioritize': False}])
+def test_prioritize_off_keeps_full_coverage(kw):
+    colr, size, cue, task = _trio()
+    assert _trio_block(colr, size, cue, task, **kw).trials_per_sample() == 12
+
+
+def test_prioritize_reduces_trials():
+    # colr x size needs 2 passes and cue's 3 levels need 2, so K = 2.
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, prioritize=[colr, size])
+    assert block.trials_per_sample() == 4
+
+
+def test_prioritize_every_factor_is_full_coverage():
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, prioritize=[colr, size, cue])
+    assert block.trials_per_sample() == 12
+
+
+def test_prioritize_empty_demotes_everything():
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, prioritize=[])
+    assert block.trials_per_sample() == 4
+
+
+def test_prioritize_ignores_duplicates():
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, prioritize=[colr, colr, size])
+    assert block.trials_per_sample() == 4
+
+
+def test_prioritize_demoting_crossed_factor_is_harmless():
+    # `task` is crossed, so its singleton group is satisfied by every pass.
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, listed=[task, colr, size, cue],
+                        prioritize=[colr, size])
+    assert block.trials_per_sample() == 4
+
+
+def test_prioritize_keeps_both_guarantees():
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, prioritize=[colr, size])
+    exps = synthesize_trials(block, 1, sampling_strategy=IterateGen)
+    assert exps
+    for e in exps:
+        assert set(zip(e['colr'], e['size'])) == set(
+            (c, s) for c in ['red', 'green'] for s in ['big', 'small'])
+        assert set(e['cue']) == {'c1', 'c2', 'c3'}
+
+
+def test_two_coverage_constraints_take_the_larger():
+    # Two constraints express the same thing as prioritize=[colr, size].
+    colr, size, cue, task = _trio()
+    block = CrossBlock(design=[task, colr, size, cue], crossing=[task],
+                       constraints=[CoverAllCombinations(colr, size),
+                                    CoverAllCombinations(cue)])
+    assert block.trials_per_sample() == 4
+    exps = synthesize_trials(block, 1, sampling_strategy=IterateGen)
+    assert exps
+    for e in exps:
+        assert set(zip(e['colr'], e['size'])) == set(
+            (c, s) for c in ['red', 'green'] for s in ['big', 'small'])
+        assert set(e['cue']) == {'c1', 'c2', 'c3'}
+
+
+def test_prioritize_unknown_factor_raises():
+    colr, size, cue, task = _trio()
+    with pytest.raises(ValueError):
+        CoverAllCombinations(colr, size, prioritize=[cue])
+
+
+def test_prioritize_repr_shows_the_choice():
+    colr, size, cue, task = _trio()
+    assert repr(CoverAllCombinations(colr, size, cue, prioritize=[colr, size])) == \
+        'CoverAllCombinations(colr, size, cue, prioritize=[colr, size])'
+    assert repr(CoverAllCombinations(colr, size, cue, prioritize=True)) == \
+        'CoverAllCombinations(colr, size, cue, prioritize=True)'
+
+
+def test_prioritize_in_nest():
+    colors, color, word, congruency, _ = _stroop(3)
+    cue = Factor('cue', ['c1', 'c2', 'c3', 'c4'])
+    inner = CrossBlock([congruency, color, word, cue], [congruency, color], [])
+    instance = Factor('instance', ['a', 'b'])
+    outer = CrossBlock([instance], [instance], [])
+    # Full coverage: each incongruent cell is the only one that can serve its
+    # own 8 word-cue combinations, so K = 8 over passes of 6.
+    full = Nest(outer, inner, [CoverAllCombinations(color, word, cue)])
+    assert full.trials_per_sample() == 48
+    # Demoting cue leaves the 6 free color-word pairs over 3 slots: K = 2.
+    fewer = Nest(outer, inner,
+                 [CoverAllCombinations(color, word, cue, prioritize=[color, word])])
+    assert fewer.trials_per_sample() == 12
+
+
+def test_prioritize_with_weighted_crossing():
+    # Weighted levels on the crossed factor still size correctly once some of
+    # the listed factors are demoted.
+    colors, color, word, congruency = _stroop_weighted(4, 2)
+    cue = Factor('cue', ['c1', 'c2', 'c3'])
+    block = CrossBlock([congruency, color, word, cue], [congruency, color],
+                       [CoverAllCombinations(color, word, cue,
+                                             prioritize=[color, word])])
+    exps = synthesize_trials(block, 1, sampling_strategy=IterateGen)
+    assert exps
+    for e in exps:
+        assert _covers_all(e, colors)
+        assert set(e['cue']) == {'c1', 'c2', 'c3'}
+
+
+# ~~~~~~~~~~~~ Interactive negotiation ~~~~~~~~~~~~
+
+def test_interactive_accepting_the_offer_changes_nothing(monkeypatch):
+    colr, size, cue, task = _trio()
+    answers = _Answers('y')
+    monkeypatch.setattr('builtins.input', answers)
+    block = _trio_block(colr, size, cue, task, prioritize=True)
+    assert block.trials_per_sample() == 12
+    assert '12 trials' in answers.prompts[0]
+
+
+def test_interactive_declining_then_choosing(monkeypatch, capsys):
+    colr, size, cue, task = _trio()
+    monkeypatch.setattr('builtins.input', _Answers('n', 'colr, size', 'y'))
+    block = _trio_block(colr, size, cue, task, prioritize=True)
+    assert block.trials_per_sample() == 4
+    out = capsys.readouterr().out
+    assert 'That gives 4 trials' in out
+    assert 'cue' in out
+    # The session has to be reproducible without the prompt.
+    assert 'prioritize=[colr, size]' in out
+
+
+def test_interactive_reprompts_on_unknown_factor(monkeypatch, capsys):
+    colr, size, cue, task = _trio()
+    monkeypatch.setattr('builtins.input', _Answers('n', 'task', 'colr, size', 'y'))
+    block = _trio_block(colr, size, cue, task, prioritize=True)
+    assert block.trials_per_sample() == 4
+    assert 'Not listed in this constraint: task' in capsys.readouterr().out
+
+
+def test_interactive_single_factor_skips_the_prompt(monkeypatch):
+    # Nothing to demote, so the user is never asked.
+    colr, size, cue, task = _trio()
+    monkeypatch.setattr('builtins.input', _Answers())
+    block = _trio_block(colr, size, cue, task, listed=[cue], prioritize=True)
+    assert block.trials_per_sample() == 4
+
+
+def test_prioritize_without_interactive_input_warns(monkeypatch):
+    colr, size, cue, task = _trio()
+
+    def _no_input(prompt=''):
+        raise OSError('reading from stdin while output is captured')
+
+    monkeypatch.setattr('builtins.input', _no_input)
+    with pytest.warns(UserWarning, match='no interactive input'):
+        block = _trio_block(colr, size, cue, task, prioritize=True)
+    assert block.trials_per_sample() == 12
 
 
 # ~~~~~~~~~~~~ Validation errors ~~~~~~~~~~~~

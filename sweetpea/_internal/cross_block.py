@@ -119,7 +119,7 @@ class MultiCrossBlockRepeat(Block):
         # needed for coverage. Must run before trials_per_sample() is first cached.
         for ct in self.constraints:
             if isinstance(ct, CoverAllCombinations):
-                target = ct.autosize_trials(self)
+                target = ct.negotiate_trials(self)
                 if target > self.min_trials:
                     self.min_trials = target
                     for count in self.crossing_sustain_counts:

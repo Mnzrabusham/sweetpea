@@ -1,6 +1,7 @@
 """This module provides constraints for CNF generation."""
 
 import operator as op
+import warnings
 from abc import abstractmethod
 from copy import deepcopy
 from typing import List, Tuple, Any, Union, cast, Dict, Callable, Optional
@@ -1272,6 +1273,23 @@ def _val_name(x):
     return getattr(x, "name", x)
 
 
+class _NoInput(Exception):
+    """Raised when a prompt cannot be answered because no interactive input is
+    available: pytest, CI, or a piped script."""
+
+
+def _prompt(message: str) -> str:
+    """Read one line of interactive input, or raise `_NoInput`.
+
+    Availability is decided by attempting the read rather than by consulting
+    `sys.stdin.isatty()`, which reports False under Jupyter---a normal place to
+    build a design, and one where prompting does work."""
+    try:
+        return input(message)
+    except (EOFError, OSError):
+        raise _NoInput()
+
+
 class CoverAllCombinations(Constraint):
     """Requires that the trials of an experiment collectively include every realizable
     combination of `factors` at least once.
@@ -1281,23 +1299,66 @@ class CoverAllCombinations(Constraint):
     every combination. The number of trials needed is computed automatically and the
     block is grown to fit (see the auto-sizing notes on the block constructors).
 
+    `prioritize` trades coverage for a shorter experiment. Given a list of the
+    listed factors, those stay fully crossed and each remaining factor is
+    demoted to needing only each of its own levels present. `True` negotiates
+    that choice interactively as the block is built.
+
     Usage::
 
         Nest(outer, inner, [CoverAllCombinations(color, word)])
         CrossBlock(design, crossing, [CoverAllCombinations(color, word)])
+        CrossBlock(design, crossing, [CoverAllCombinations(color, word, cue,
+                                                           prioritize=[color, word])])
     """
 
-    def __init__(self, *factors):
+    def __init__(self, *factors, prioritize=False):
         who = "CoverAllCombinations"
         factor_list = list(factors)
         if factor_list == []:
             raise ValueError(who, "factor list must be non-empty")
         argcheck(who, factor_list, make_islistof(Factor), "factors")
         self.factors = factor_list
+        # Coverage requirements, one fully-crossed combination set per group.
+        # The lone default group is the full cross of `factors`; a priority list
+        # splits it into the kept group plus a singleton per demoted factor.
+        self.groups = cast(List[List[Factor]], [factor_list])
+        if isinstance(prioritize, (list, tuple)):
+            priority = list(prioritize)
+            argcheck(who, priority, make_islistof(Factor), "prioritize")
+            self._check_priority(priority, who)
+            self.prioritize = cast(Union[bool, List[Factor]], priority)
+            self.groups = self._grouping_for(priority)
+        else:
+            self.prioritize = cast(Union[bool, List[Factor]], bool(prioritize))
         # Set by Nest during construction: the inner block whose crossing determines
         # which listed factors are pinned vs. free. None for other block types, in
         # which case the attached block itself is analyzed.
         self._inner_block = cast(Optional[MultiCrossBlockRepeat], None)
+
+    # ~~~~~~~~~~~~~~ Priority grouping ~~~~~~~~~~~~~~
+
+    def _check_priority(self, priority, who) -> None:
+        for f in priority:
+            if f not in self.factors:
+                raise ValueError((who,
+                                  "'{}' is not one of the factors listed in the constraint "
+                                  "({})".format(f.name,
+                                                ", ".join(g.name for g in self.factors))))
+
+    def _grouping_for(self, priority) -> List[List[Factor]]:
+        """Groups for a priority list: the named factors form one fully-crossed
+        group, and each remaining listed factor becomes a group of its own, so
+        only its individual levels are required to appear.
+
+        An empty priority list demotes everything, which is the cheapest
+        grouping; naming every factor reproduces the default single group."""
+        kept = []  # type: List[Factor]
+        for f in priority:
+            if f not in kept:
+                kept.append(f)
+        demoted = [f for f in self.factors if f not in kept]
+        return ([kept] if kept else []) + [[f] for f in demoted]
 
     # ~~~~~~~~~~~~~~ Coverage analysis (the "K" computation) ~~~~~~~~~~~~~~
 
@@ -1336,11 +1397,11 @@ class CoverAllCombinations(Constraint):
                         return True
         return False
 
-    def _coverage_analysis(self, block, exclusion_block=None):
-        """Structural analysis over `self.factors` for the given analysis block.
-        When `exclusion_block` is given (e.g. the merged block of a Nest), its
-        exclusions are folded into realizability as well, so that an Exclude at
-        any level simply removes combinations from the required set.
+    def _coverage_analysis(self, block, factors, exclusion_block=None):
+        """Structural analysis over `factors` (one coverage group) for the given
+        analysis block. When `exclusion_block` is given (e.g. the merged block of
+        a Nest), its exclusions are folded into realizability as well, so that an
+        Exclude at any level simply removes combinations from the required set.
 
         Returns ``(R, forced, R_free, slots, combo_levels, slot_weights,
         forced_weights)`` where:
@@ -1358,7 +1419,7 @@ class CoverAllCombinations(Constraint):
         - ``forced_weights``: per forced combo, its occurrences per instance
           (sum of the combination weights of the cells that force it).
         """
-        listed = self.factors
+        listed = factors
         crossing_factors = self._cell_factors(block)
         if not crossing_factors:
             return (set(), set(), set(), [], {}, [], {})
@@ -1410,11 +1471,16 @@ class CoverAllCombinations(Constraint):
         return (R, forced, R_free, slots, combo_levels, slot_weights, forced_weights)
 
     def required_instances(self, block=None):
-        """Minimum number of instances (K) needed to cover ``R_free``."""
+        """Minimum number of instances (K) needed to cover ``R_free``, over the
+        largest of the coverage groups."""
         if block is None:
             block = self._inner_block
-        (_, _, R_free, slots, _, slot_weights, _) = self._coverage_analysis(block)
-        return self._min_instances(R_free, slots, slot_weights)
+        k = 1
+        for group in self.groups:
+            (_, _, R_free, slots, _, slot_weights, _) = \
+                self._coverage_analysis(block, group)
+            k = max(k, self._min_instances(R_free, slots, slot_weights))
+        return k
 
     def _relevant_constraints(self, sizing_block):
         """The sizing block's constraints that are statically reconciled into the
@@ -1505,9 +1571,53 @@ class CoverAllCombinations(Constraint):
         for c in analysis.crossings:
             if c is not cell_crossing and any(f in c for f in self.factors):
                 return 0
-        (R, forced, R_free, slots, _, slot_weights, forced_weights) = \
-            self._coverage_analysis(analysis, exclusion_block=block)
         (pins, caps, seqs) = self._relevant_constraints(block)
+        if analysis is not block:
+            # Nest: one instance = one inner-block pass.
+            instance_len = analysis.trials_per_sample() - analysis.common_preamble_size()
+        else:
+            # crossing_size already folds in the crossing's sustain count.
+            instance_len = block.crossing_size(cell_crossing)
+        if instance_len <= 0:
+            return 0
+        # Sequential enrichment applies to listed factors the cells leave free.
+        cell_factors = self._cell_factors(analysis)
+        seq_free = [ct for ct in seqs if ct.factor not in cell_factors]
+        # Each group is sized on its own and the block takes the largest K: one
+        # trial serves one combination from every group at once, so the groups
+        # do not add up. A priority list only ever produces groups that are
+        # disjoint in the factors the cells leave free, so the per-group counts
+        # are independent and the largest is exact rather than a lower bound.
+        k = 1
+        for group in self.groups:
+            k = max(k, self._instances_for_group(block, analysis, group, instance_len,
+                                                 pins, caps, seq_free, who))
+        total = k * instance_len
+        # Round up to complete passes of every crossing. Iterating settles on a
+        # common multiple; the iteration bound avoids chasing a large LCM when
+        # pass lengths are co-prime. crossing_size already folds in sustain.
+        passes = [block.crossing_size(c) for c in block.crossings]
+        for _ in range(4):
+            rounded = total
+            for p in passes:
+                if p > 0 and rounded % p != 0:
+                    rounded = ((rounded // p) + 1) * p
+            if rounded == total:
+                break
+            total = rounded
+        return total
+
+    def _instances_for_group(self, block, analysis, group, instance_len,
+                             pins, caps, seq_free, who) -> int:
+        """Instances (K) needed for one coverage group, with the statically
+        modeled effects of the block's other constraints folded in.
+
+        The ExactlyK arithmetic here counts one group's requirements. Across
+        several groups it therefore under-counts a level's total demand; the
+        residual is left to the solver, as the in-a-row family and LatinSquare
+        already are."""
+        (R, forced, R_free, slots, _, slot_weights, forced_weights) = \
+            self._coverage_analysis(analysis, group, exclusion_block=block)
         # Definitive check: `required` = the capped level's occurrences at K=1
         # (each free combo at least once + each forced combo at its per-instance
         # weight). Adding instances only increases the forced term, so a cap
@@ -1523,17 +1633,6 @@ class CoverAllCombinations(Constraint):
                                   "with '{} {}' but an ExactlyK constraint allows exactly "
                                   "{}".format(required, fname, lname, ct.k)))
         k_opt = self._min_instances(R_free, slots, slot_weights)
-        if analysis is not block:
-            # Nest: one instance = one inner-block pass.
-            instance_len = analysis.trials_per_sample() - analysis.common_preamble_size()
-        else:
-            # crossing_size already folds in the crossing's sustain count.
-            instance_len = block.crossing_size(cell_crossing)
-        if instance_len <= 0:
-            return 0
-        # Sequential enrichment applies to listed factors the cells leave free.
-        cell_factors = self._cell_factors(analysis)
-        seq_free = [ct for ct in seqs if ct.factor not in cell_factors]
         # Scan ceiling: |R_free| instances provably suffice for the plain model
         # (see _min_instances), so twice that (or twice k_opt) leaves headroom
         # for what constraints consume; exhausting it => irreconcilable.
@@ -1542,26 +1641,74 @@ class CoverAllCombinations(Constraint):
         while k <= cap:
             if self._feasible_at(k, instance_len, R_free, forced, slots, pins, caps,
                                  seq_free, block, slot_weights, forced_weights):
-                break
+                return k
             k += 1
-        else:
-            conflicting = [repr(ct) for ct in (pins + caps + seq_free)]
-            raise ValueError((who,
-                              "no trial count up to {} instances reconciles coverage with "
-                              "the other constraints ({})".format(cap, ", ".join(conflicting))))
-        total = k * instance_len
-        # Round up to complete passes of every crossing. Iterating settles on a
-        # common multiple; the iteration bound avoids chasing a large LCM when
-        # pass lengths are co-prime. crossing_size already folds in sustain.
-        passes = [block.crossing_size(c) for c in block.crossings]
-        for _ in range(4):
-            rounded = total
-            for p in passes:
-                if p > 0 and rounded % p != 0:
-                    rounded = ((rounded // p) + 1) * p
-            if rounded == total:
-                break
-            total = rounded
+        conflicting = [repr(ct) for ct in (pins + caps + seq_free)]
+        raise ValueError((who,
+                          "no trial count up to {} instances reconciles coverage with "
+                          "the other constraints ({})".format(cap, ", ".join(conflicting))))
+
+    # ~~~~~~~~~~~~~~ Interactive priority negotiation ~~~~~~~~~~~~~~
+
+    def negotiate_trials(self, block) -> int:
+        """`autosize_trials`, plus the interactive negotiation that
+        ``prioritize=True`` asks for. Separate so that `autosize_trials` stays a
+        pure computation the negotiation can re-run per candidate grouping."""
+        total = self.autosize_trials(block)
+        if self.prioritize is not True or len(self.factors) < 2:
+            # A single listed factor has nothing to demote.
+            return total
+        names = ", ".join(f.name for f in self.factors)
+        by_name = {f.name: f for f in self.factors}
+        chosen = cast(Optional[List[Factor]], None)
+        try:
+            while True:
+                answer = _prompt("\n{} needs {} trials.\nAccept? [Y/n] ".format(
+                    repr(self), total))
+                if answer.strip().lower() not in ("n", "no"):
+                    break
+                while True:
+                    raw = _prompt("Which factors should stay fully crossed?\n"
+                                  "(comma-separated, from: {})\n> ".format(names))
+                    wanted = [w.strip() for w in raw.split(",") if w.strip()]
+                    unknown = [w for w in wanted if w not in by_name]
+                    if not unknown:
+                        break
+                    print("Not listed in this constraint: {}.".format(", ".join(unknown)))
+                priority = [by_name[w] for w in wanted]
+                candidate = self._grouping_for(priority)
+                saved = self.groups
+                self.groups = candidate
+                try:
+                    total = self.autosize_trials(block)
+                except ValueError as e:
+                    # Reject the candidate rather than aborting the whole block:
+                    # the user can still pick a grouping that reconciles.
+                    self.groups = saved
+                    total = self.autosize_trials(block)
+                    print("That grouping cannot be reconciled: {}".format(e))
+                    continue
+                chosen = priority
+                demoted = [str(g[0].name) for g in candidate
+                           if len(g) == 1 and g[0] not in priority]
+                if demoted:
+                    print("That gives {} trials. ({}: each level appears at least "
+                          "once)".format(total, ", ".join(demoted)))
+                else:
+                    print("That gives {} trials.".format(total))
+        except _NoInput:
+            self.groups = [self.factors]
+            total = self.autosize_trials(block)
+            warnings.warn("CoverAllCombinations: no interactive input available, so the "
+                          "prioritize=True prompt was skipped; using the computed trial "
+                          "count of {}".format(total))
+            return total
+        if chosen is not None:
+            # An interactive design is otherwise unreproducible: re-running the
+            # script re-prompts, and the result depends on what was typed.
+            print("\nTo skip this prompt next time:\n    CoverAllCombinations({}, "
+                  "prioritize=[{}])".format(", ".join(str(f.name) for f in self.factors),
+                                            ", ".join(str(f.name) for f in chosen)))
         return total
 
     @staticmethod
@@ -1648,8 +1795,15 @@ class CoverAllCombinations(Constraint):
         return any(factor.uses_factor(f) for factor in self.factors)
 
     def desugar(self, replacements: dict) -> List[Constraint]:
-        factors = [replacements.get(f, [f, f])[1] for f in self.factors]
-        c = CoverAllCombinations(*factors)
+        def replace(fs):
+            return [replacements.get(f, [f, f])[1] for f in fs]
+        c = CoverAllCombinations(*replace(self.factors))
+        c.prioritize = (replace(self.prioritize)
+                        if isinstance(self.prioritize, list) else self.prioritize)
+        # Groups hold the same Factor objects as `factors`, so they need the
+        # same mapping: otherwise a weighted design keeps pre-desugar factors
+        # here and coverage is computed against factors the block no longer has.
+        c.groups = [replace(g) for g in self.groups]
         c._inner_block = self._inner_block
         return [c]
 
@@ -1665,48 +1819,58 @@ class CoverAllCombinations(Constraint):
             validate_factor(block, f)
 
     def apply(self, block: Block, backend_request: BackendRequest) -> None:
-        (_, _, R_free, _, combo_levels, _, _) = self._coverage_analysis(
-            self._analysis_block(block), exclusion_block=block)
-        if not R_free:
-            return
         preamble = block.common_preamble_size()
         num_trials = block.trials_per_sample()
         trials = list(range(1 + preamble, num_trials + 1))
 
         fresh = backend_request.fresh
         formula_parts = cast(List[FormulaWithIff], [])
-        for combo in R_free:
-            levels = combo_levels[combo]
-            state_vars = []
-            for t in trials:
-                sv = fresh
-                fresh += 1
-                state_vars.append(sv)
-                formula_parts.append(Iff(sv, And(list(block.encode_combination(levels, t)))))
-            # At least one trial must instantiate this combination.
-            formula_parts.append(Or(state_vars))
+        analysis = self._analysis_block(block)
+        for group in self.groups:
+            (_, _, R_free, _, combo_levels, _, _) = self._coverage_analysis(
+                analysis, group, exclusion_block=block)
+            # A group's combinations name only its own factors, so a demoted
+            # singleton asks for its level alone; encode_combination takes the
+            # partial assignment as-is.
+            for combo in R_free:
+                levels = combo_levels[combo]
+                state_vars = []
+                for t in trials:
+                    sv = fresh
+                    fresh += 1
+                    state_vars.append(sv)
+                    formula_parts.append(Iff(sv, And(list(block.encode_combination(levels, t)))))
+                # At least one trial must instantiate this combination.
+                formula_parts.append(Or(state_vars))
+        if not formula_parts:
+            return
 
         (cnf, new_fresh) = block.cnf_fn(And(formula_parts), fresh)
         backend_request.cnfs.append(cnf)
         backend_request.fresh = new_fresh
 
     def potential_sample_conforms(self, sample: dict, block: Block) -> bool:
-        (_, _, R_free, _, _, _, _) = self._coverage_analysis(
-            self._analysis_block(block), exclusion_block=block)
-        if not R_free:
-            return True
         num_trials = block.trials_per_sample()
-        for combo in R_free:
-            need = dict(combo)  # factor_name -> level_name
-            found = False
-            for t in range(num_trials):
-                if all(sample[f][t].name == need[f.name] for f in self.factors):
-                    found = True
-                    break
-            if not found:
-                return False
+        analysis = self._analysis_block(block)
+        for group in self.groups:
+            (_, _, R_free, _, _, _, _) = self._coverage_analysis(
+                analysis, group, exclusion_block=block)
+            for combo in R_free:
+                need = dict(combo)  # factor_name -> level_name
+                found = False
+                for t in range(num_trials):
+                    if all(sample[f][t].name == need[f.name] for f in group):
+                        found = True
+                        break
+                if not found:
+                    return False
         return True
 
     def __repr__(self):
-        return "CoverAllCombinations({})".format(
-            ", ".join([f.name for f in self.factors]))
+        args = [f.name for f in self.factors]
+        if isinstance(self.prioritize, list):
+            args.append("prioritize=[{}]".format(
+                ", ".join(f.name for f in self.prioritize)))
+        elif self.prioritize:
+            args.append("prioritize=True")
+        return "CoverAllCombinations({})".format(", ".join(args))

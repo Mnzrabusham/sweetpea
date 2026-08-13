@@ -142,7 +142,7 @@ Constraints
               :type factors: List[Factor]
               :rtype: Constraint
 
-.. class:: sweetpea.CoverAllCombinations(*factors)
+.. class:: sweetpea.CoverAllCombinations(*factors, prioritize=False)
 
               Constrains an experiment so that its trials collectively
               include every realizable combination of the levels of
@@ -175,11 +175,25 @@ Constraints
               weighted levels elsewhere in the crossing are supported,
               and they change the trial count accordingly.
 
+              Since the combinations to cover are the product of the
+              listed factors' levels, `prioritize` trades coverage for
+              a shorter experiment. Given a list of the listed factors,
+              those stay fully crossed, while each remaining factor is
+              demoted to needing only each of its own levels present.
+              Passing ``True`` instead reports the trial count as the
+              block is built and asks which factors to keep; where no
+              interactive input is available, that prompt is skipped
+              with a warning and the full count is used.
+
               See :ref:`Covering All Combinations <covering-all-combinations>`
               for more information.
 
               :param factors: the factors whose level combinations must all appear
               :type factors: Factor
+              :param prioritize: the factors to keep fully crossed, or a
+                                 boolean selecting full coverage or an
+                                 interactive choice
+              :type prioritize: Union[bool, List[Factor]]
               :rtype: Constraint
 
 .. class:: sweetpea.ContinuousConstraint(factors, predicate)

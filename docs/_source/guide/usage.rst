@@ -1316,3 +1316,79 @@ and coverage takes that into account when sizing the block. The levels
 of the factors listed in :class:`.CoverAllCombinations` itself must be
 unweighted, however, since the meaning of a weight on a covered
 combination is not currently defined.
+
+Trading Coverage for Fewer Trials
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The set of combinations to cover is the product of the levels of the
+listed factors, so each factor added to
+:class:`.CoverAllCombinations` multiplies the trial count. Covering
+`colr`, `size`, and `cue` together takes twelve trials.
+
+  .. doctest::
+
+    >>> from sweetpea import Factor, CrossBlock, CoverAllCombinations
+    >>> colr = Factor("colr", ["red", "green"])
+    >>> size = Factor("size", ["big", "small"])
+    >>> cue = Factor("cue", ["c1", "c2", "c3"])
+    >>> task = Factor("task", ["A", "B"])
+    >>> design = [task, colr, size, cue]
+    >>> tb = CrossBlock(design=design, crossing=[task],
+    ...                 constraints=[CoverAllCombinations(colr, size, cue)])
+    >>> tb.trials_per_sample()
+    12
+
+The `prioritize` argument names the factors to keep fully crossed. The
+remaining listed factors are demoted: each of their levels must still
+appear at least once, but their combinations with the other factors
+are no longer required. Keeping `colr` and `size` crossed brings the
+same design down to four trials.
+
+  .. doctest::
+
+    >>> pb = CrossBlock(design=design, crossing=[task],
+    ...                 constraints=[CoverAllCombinations(colr, size, cue,
+    ...                                                   prioritize=[colr, size])])
+    >>> pb.trials_per_sample()
+    4
+
+All four `colr`-`size` combinations still appear and all three `cue`
+levels still appear, but the twelve three-way combinations no longer
+have to.
+
+Passing ``prioritize=True`` asks for that choice while the block is
+being built. SweetPea reports the trial count, and if it is declined,
+asks which factors to keep and reports the new count.
+
+  .. code-block:: text
+
+    CoverAllCombinations(colr, size, cue, prioritize=True) needs 12 trials.
+    Accept? [Y/n] n
+    Which factors should stay fully crossed?
+    (comma-separated, from: colr, size, cue)
+    > colr, size
+    That gives 4 trials. (cue: each level appears at least once)
+
+    CoverAllCombinations(colr, size, cue, prioritize=True) needs 4 trials.
+    Accept? [Y/n] y
+
+    To skip this prompt next time:
+        CoverAllCombinations(colr, size, cue, prioritize=[colr, size])
+
+The prompt ends by printing the equivalent `prioritize` list, because a
+script that asks a question otherwise produces a different design
+depending on what was typed. Where no interactive input is
+available---under a test runner, or a piped script---the prompt is
+skipped with a warning and the full coverage count is used.
+
+Listing the same factors in two separate constraints expresses the
+same thing without the `prioritize` argument, since each constraint is
+sized on its own and the block takes the larger count.
+
+  .. doctest::
+
+    >>> sb = CrossBlock(design=design, crossing=[task],
+    ...                 constraints=[CoverAllCombinations(colr, size),
+    ...                              CoverAllCombinations(cue)])
+    >>> sb.trials_per_sample()
+    4
