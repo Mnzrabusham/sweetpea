@@ -310,23 +310,8 @@ def _trio_block(colr, size, cue, task, listed=None, **kw):
                       constraints=[CoverAllCombinations(*listed, **kw)])
 
 
-class _Answers:
-    """Stands in for `input`, replaying scripted answers and recording the
-    prompts it was asked."""
-
-    def __init__(self, *answers):
-        self.answers = list(answers)
-        self.prompts = []
-
-    def __call__(self, prompt=''):
-        self.prompts.append(prompt)
-        if not self.answers:
-            raise AssertionError('unexpected extra prompt: {}'.format(prompt))
-        return self.answers.pop(0)
-
-
-@pytest.mark.parametrize('kw', [{}, {'prioritize': False}])
-def test_prioritize_off_keeps_full_coverage(kw):
+@pytest.mark.parametrize('kw', [{}, {'prioritize': []}])
+def test_prioritize_empty_keeps_full_coverage(kw):
     colr, size, cue, task = _trio()
     assert _trio_block(colr, size, cue, task, **kw).trials_per_sample() == 12
 
@@ -342,12 +327,6 @@ def test_prioritize_every_factor_is_full_coverage():
     colr, size, cue, task = _trio()
     block = _trio_block(colr, size, cue, task, prioritize=[colr, size, cue])
     assert block.trials_per_sample() == 12
-
-
-def test_prioritize_empty_demotes_everything():
-    colr, size, cue, task = _trio()
-    block = _trio_block(colr, size, cue, task, prioritize=[])
-    assert block.trials_per_sample() == 4
 
 
 def test_prioritize_ignores_duplicates():
@@ -396,12 +375,18 @@ def test_prioritize_unknown_factor_raises():
         CoverAllCombinations(colr, size, prioritize=[cue])
 
 
+def test_prioritize_rejects_a_bool():
+    colr, size, cue, task = _trio()
+    with pytest.raises(ValueError, match='prioritize'):
+        CoverAllCombinations(colr, size, cue, prioritize=True)
+
+
 def test_prioritize_repr_shows_the_choice():
     colr, size, cue, task = _trio()
     assert repr(CoverAllCombinations(colr, size, cue, prioritize=[colr, size])) == \
         'CoverAllCombinations(colr, size, cue, prioritize=[colr, size])'
-    assert repr(CoverAllCombinations(colr, size, cue, prioritize=True)) == \
-        'CoverAllCombinations(colr, size, cue, prioritize=True)'
+    assert repr(CoverAllCombinations(colr, size, cue)) == \
+        'CoverAllCombinations(colr, size, cue)'
 
 
 def test_prioritize_in_nest():
@@ -435,55 +420,42 @@ def test_prioritize_with_weighted_crossing():
         assert set(e['cue']) == {'c1', 'c2', 'c3'}
 
 
-# ~~~~~~~~~~~~ Interactive negotiation ~~~~~~~~~~~~
+# ~~~~~~~~~~~~ Reporting the trial count ~~~~~~~~~~~~
 
-def test_interactive_accepting_the_offer_changes_nothing(monkeypatch):
+def test_reports_the_count_under_full_coverage(capsys):
     colr, size, cue, task = _trio()
-    answers = _Answers('y')
-    monkeypatch.setattr('builtins.input', answers)
-    block = _trio_block(colr, size, cue, task, prioritize=True)
-    assert block.trials_per_sample() == 12
-    assert '12 trials' in answers.prompts[0]
-
-
-def test_interactive_declining_then_choosing(monkeypatch, capsys):
-    colr, size, cue, task = _trio()
-    monkeypatch.setattr('builtins.input', _Answers('n', 'colr, size', 'y'))
-    block = _trio_block(colr, size, cue, task, prioritize=True)
-    assert block.trials_per_sample() == 4
+    _trio_block(colr, size, cue, task)
     out = capsys.readouterr().out
-    assert 'That gives 4 trials' in out
-    assert 'cue' in out
-    # The session has to be reproducible without the prompt.
-    assert 'prioritize=[colr, size]' in out
+    assert 'CoverAllCombinations(colr, size, cue) requires 12 trials.' in out
+    # Nothing was demoted, so nothing is said about individual levels.
+    assert 'each level appears' not in out
 
 
-def test_interactive_reprompts_on_unknown_factor(monkeypatch, capsys):
+def test_reports_the_count_and_demotions_under_prioritize(capsys):
     colr, size, cue, task = _trio()
-    monkeypatch.setattr('builtins.input', _Answers('n', 'task', 'colr, size', 'y'))
-    block = _trio_block(colr, size, cue, task, prioritize=True)
-    assert block.trials_per_sample() == 4
-    assert 'Not listed in this constraint: task' in capsys.readouterr().out
+    _trio_block(colr, size, cue, task, prioritize=[colr, size])
+    out = capsys.readouterr().out
+    assert ('CoverAllCombinations(colr, size, cue, prioritize=[colr, size]) '
+            'requires 4 trials. (cue: each level appears at least once)') in out
 
 
-def test_interactive_single_factor_skips_the_prompt(monkeypatch):
-    # Nothing to demote, so the user is never asked.
+def test_reports_demotions_for_a_single_prioritized_factor(capsys):
+    # Every group is a singleton here, so group size cannot tell the kept
+    # factor from the demoted ones; the report comes from `prioritize`.
     colr, size, cue, task = _trio()
-    monkeypatch.setattr('builtins.input', _Answers())
-    block = _trio_block(colr, size, cue, task, listed=[cue], prioritize=True)
-    assert block.trials_per_sample() == 4
+    _trio_block(colr, size, cue, task, prioritize=[colr])
+    out = capsys.readouterr().out
+    assert '(size, cue: each level appears at least once)' in out
 
 
-def test_prioritize_without_interactive_input_warns(monkeypatch):
+def test_reports_each_constraint_separately(capsys):
     colr, size, cue, task = _trio()
-
-    def _no_input(prompt=''):
-        raise OSError('reading from stdin while output is captured')
-
-    monkeypatch.setattr('builtins.input', _no_input)
-    with pytest.warns(UserWarning, match='no interactive input'):
-        block = _trio_block(colr, size, cue, task, prioritize=True)
-    assert block.trials_per_sample() == 12
+    CrossBlock(design=[task, colr, size, cue], crossing=[task],
+               constraints=[CoverAllCombinations(colr, size),
+                            CoverAllCombinations(cue)])
+    out = capsys.readouterr().out
+    assert 'CoverAllCombinations(colr, size) requires' in out
+    assert 'CoverAllCombinations(cue) requires' in out
 
 
 # ~~~~~~~~~~~~ Validation errors ~~~~~~~~~~~~

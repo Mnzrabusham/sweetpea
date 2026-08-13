@@ -119,7 +119,13 @@ class MultiCrossBlockRepeat(Block):
         # needed for coverage. Must run before trials_per_sample() is first cached.
         for ct in self.constraints:
             if isinstance(ct, CoverAllCombinations):
-                target = ct.negotiate_trials(self)
+                target = ct.autosize_trials(self)
+                if target > 0:
+                    # Report what coverage costs, rather than the block's final
+                    # length: MinimumTrials and sustain rounding can lengthen it
+                    # further, which is not coverage's doing. A zero target means
+                    # coverage was not statically modeled, so there is no count.
+                    print(ct.sizing_message(target))
                 if target > self.min_trials:
                     self.min_trials = target
                     for count in self.crossing_sustain_counts:

@@ -1129,6 +1129,7 @@ cannot hold four combinations, so the block grows to four trials.
 
     >>> cb = CrossBlock(design=[task, colr, size], crossing=[task],
     ...                 constraints=[CoverAllCombinations(colr, size)])
+    CoverAllCombinations(colr, size) requires 4 trials.
     >>> cb.trials_per_sample()
     4
 
@@ -1164,6 +1165,7 @@ passes---nine trials---are required.
     >>> word  = Factor("word",  ["red", "green", "blue"])
     >>> b = CrossBlock(design=[color, word], crossing=[color],
     ...                constraints=[CoverAllCombinations(color, word)])
+    CoverAllCombinations(color, word) requires 9 trials.
     >>> b.trials_per_sample()
     9
 
@@ -1195,6 +1197,7 @@ ruling out one `word` level leaves six combinations and six trials.
     >>> eb = CrossBlock(design=[color, word], crossing=[color],
     ...                 constraints=[CoverAllCombinations(color, word),
     ...                              Exclude((word, "red"))])
+    CoverAllCombinations(color, word) requires 6 trials.
     >>> eb.trials_per_sample()
     6
 
@@ -1221,6 +1224,7 @@ passes.
     ...                    constraints=[])
     >>> nb = Nest(outer_block=outer, inner_block=inner,
     ...           constraints=[CoverAllCombinations(color, word)])
+    CoverAllCombinations(color, word) requires 12 trials.
     >>> nb.trials_per_sample()
     12
 
@@ -1266,6 +1270,7 @@ the block up to a fourth pass.
     >>> pb = CrossBlock(design=[color, word], crossing=[color],
     ...                 constraints=[CoverAllCombinations(color, word),
     ...                              Pin(0, (word, "red"))])
+    CoverAllCombinations(color, word) requires 12 trials.
     >>> pb.trials_per_sample()
     12
 
@@ -1323,7 +1328,8 @@ Trading Coverage for Fewer Trials
 The set of combinations to cover is the product of the levels of the
 listed factors, so each factor added to
 :class:`.CoverAllCombinations` multiplies the trial count. Covering
-`colr`, `size`, and `cue` together takes twelve trials.
+`colr`, `size`, and `cue` together takes twelve trials. The count is
+reported as the block is built, so it is visible without asking for it.
 
   .. doctest::
 
@@ -1335,6 +1341,7 @@ listed factors, so each factor added to
     >>> design = [task, colr, size, cue]
     >>> tb = CrossBlock(design=design, crossing=[task],
     ...                 constraints=[CoverAllCombinations(colr, size, cue)])
+    CoverAllCombinations(colr, size, cue) requires 12 trials.
     >>> tb.trials_per_sample()
     12
 
@@ -1342,44 +1349,21 @@ The `prioritize` argument names the factors to keep fully crossed. The
 remaining listed factors are demoted: each of their levels must still
 appear at least once, but their combinations with the other factors
 are no longer required. Keeping `colr` and `size` crossed brings the
-same design down to four trials.
+same design down to four trials, and the report names what was demoted.
 
   .. doctest::
 
     >>> pb = CrossBlock(design=design, crossing=[task],
     ...                 constraints=[CoverAllCombinations(colr, size, cue,
     ...                                                   prioritize=[colr, size])])
+    CoverAllCombinations(colr, size, cue, prioritize=[colr, size]) requires 4 trials. (cue: each level appears at least once)
     >>> pb.trials_per_sample()
     4
 
 All four `colr`-`size` combinations still appear and all three `cue`
 levels still appear, but the twelve three-way combinations no longer
-have to.
-
-Passing ``prioritize=True`` asks for that choice while the block is
-being built. SweetPea reports the trial count, and if it is declined,
-asks which factors to keep and reports the new count.
-
-  .. code-block:: text
-
-    CoverAllCombinations(colr, size, cue, prioritize=True) needs 12 trials.
-    Accept? [Y/n] n
-    Which factors should stay fully crossed?
-    (comma-separated, from: colr, size, cue)
-    > colr, size
-    That gives 4 trials. (cue: each level appears at least once)
-
-    CoverAllCombinations(colr, size, cue, prioritize=True) needs 4 trials.
-    Accept? [Y/n] y
-
-    To skip this prompt next time:
-        CoverAllCombinations(colr, size, cue, prioritize=[colr, size])
-
-The prompt ends by printing the equivalent `prioritize` list, because a
-script that asks a question otherwise produces a different design
-depending on what was typed. Where no interactive input is
-available---under a test runner, or a piped script---the prompt is
-skipped with a warning and the full coverage count is used.
+have to. To choose differently, change the `prioritize` list and build
+the block again.
 
 Listing the same factors in two separate constraints expresses the
 same thing without the `prioritize` argument, since each constraint is
@@ -1390,5 +1374,7 @@ sized on its own and the block takes the larger count.
     >>> sb = CrossBlock(design=design, crossing=[task],
     ...                 constraints=[CoverAllCombinations(colr, size),
     ...                              CoverAllCombinations(cue)])
+    CoverAllCombinations(colr, size) requires 4 trials.
+    CoverAllCombinations(cue) requires 4 trials.
     >>> sb.trials_per_sample()
     4

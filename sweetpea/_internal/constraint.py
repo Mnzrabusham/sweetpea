@@ -1,7 +1,6 @@
 """This module provides constraints for CNF generation."""
 
 import operator as op
-import warnings
 from abc import abstractmethod
 from copy import deepcopy
 from typing import List, Tuple, Any, Union, cast, Dict, Callable, Optional
@@ -1273,36 +1272,22 @@ def _val_name(x):
     return getattr(x, "name", x)
 
 
-class _NoInput(Exception):
-    """Raised when a prompt cannot be answered because no interactive input is
-    available: pytest, CI, or a piped script."""
-
-
-def _prompt(message: str) -> str:
-    """Read one line of interactive input, or raise `_NoInput`.
-
-    Availability is decided by attempting the read rather than by consulting
-    `sys.stdin.isatty()`, which reports False under Jupyter---a normal place to
-    build a design, and one where prompting does work."""
-    try:
-        return input(message)
-    except (EOFError, OSError):
-        raise _NoInput()
-
-
 class CoverAllCombinations(Constraint):
     """Requires that the trials of an experiment collectively include every realizable
-    combination of `factors` at least once.
+    combination of `factors` at least once, or a weaker requirement where
+    `prioritize` names only some of them.
 
     Factors left out of a crossing are otherwise assigned freely by the solver; this
     constraint coordinates those free choices so that the union of all trials covers
     every combination. The number of trials needed is computed automatically and the
     block is grown to fit (see the auto-sizing notes on the block constructors).
 
-    `prioritize` trades coverage for a shorter experiment. Given a list of the
-    listed factors, those stay fully crossed and each remaining factor is
-    demoted to needing only each of its own levels present. `True` negotiates
-    that choice interactively as the block is built.
+    The two arguments do different jobs: `factors` sets what the constraint
+    governs, and `prioritize` sets how strongly. A factor named in `prioritize`
+    must appear in combination with the others named there; a factor left out of
+    it needs only each of its own levels to appear somewhere, in no particular
+    combination. Naming none of them---the default---requires every combination
+    of `factors`, and naming a subset trades coverage for a shorter experiment.
 
     Usage::
 
@@ -1312,25 +1297,24 @@ class CoverAllCombinations(Constraint):
                                                            prioritize=[color, word])])
     """
 
-    def __init__(self, *factors, prioritize=False):
+    def __init__(self, *factors, prioritize=[]):
         who = "CoverAllCombinations"
         factor_list = list(factors)
         if factor_list == []:
             raise ValueError(who, "factor list must be non-empty")
         argcheck(who, factor_list, make_islistof(Factor), "factors")
         self.factors = factor_list
+        # Checked before list(), so that a non-iterable (e.g. a stray boolean)
+        # reports the parameter by name instead of raising from the conversion.
+        argcheck(who, prioritize, make_islistof(Factor), "prioritize")
+        priority = list(prioritize)
+        self._check_priority(priority, who)
+        self.prioritize = priority
         # Coverage requirements, one fully-crossed combination set per group.
         # The lone default group is the full cross of `factors`; a priority list
         # splits it into the kept group plus a singleton per demoted factor.
-        self.groups = cast(List[List[Factor]], [factor_list])
-        if isinstance(prioritize, (list, tuple)):
-            priority = list(prioritize)
-            argcheck(who, priority, make_islistof(Factor), "prioritize")
-            self._check_priority(priority, who)
-            self.prioritize = cast(Union[bool, List[Factor]], priority)
-            self.groups = self._grouping_for(priority)
-        else:
-            self.prioritize = cast(Union[bool, List[Factor]], bool(prioritize))
+        self.groups = (self._grouping_for(priority) if priority
+                       else cast(List[List[Factor]], [factor_list]))
         # Set by Nest during construction: the inner block whose crossing determines
         # which listed factors are pinned vs. free. None for other block types, in
         # which case the attached block itself is analyzed.
@@ -1648,68 +1632,17 @@ class CoverAllCombinations(Constraint):
                           "no trial count up to {} instances reconciles coverage with "
                           "the other constraints ({})".format(cap, ", ".join(conflicting))))
 
-    # ~~~~~~~~~~~~~~ Interactive priority negotiation ~~~~~~~~~~~~~~
+    def sizing_message(self, total) -> str:
+        """The line a block reports as it grows itself for coverage.
 
-    def negotiate_trials(self, block) -> int:
-        """`autosize_trials`, plus the interactive negotiation that
-        ``prioritize=True`` asks for. Separate so that `autosize_trials` stays a
-        pure computation the negotiation can re-run per candidate grouping."""
-        total = self.autosize_trials(block)
-        if self.prioritize is not True or len(self.factors) < 2:
-            # A single listed factor has nothing to demote.
-            return total
-        names = ", ".join(f.name for f in self.factors)
-        by_name = {f.name: f for f in self.factors}
-        chosen = cast(Optional[List[Factor]], None)
-        try:
-            while True:
-                answer = _prompt("\n{} needs {} trials.\nAccept? [Y/n] ".format(
-                    repr(self), total))
-                if answer.strip().lower() not in ("n", "no"):
-                    break
-                while True:
-                    raw = _prompt("Which factors should stay fully crossed?\n"
-                                  "(comma-separated, from: {})\n> ".format(names))
-                    wanted = [w.strip() for w in raw.split(",") if w.strip()]
-                    unknown = [w for w in wanted if w not in by_name]
-                    if not unknown:
-                        break
-                    print("Not listed in this constraint: {}.".format(", ".join(unknown)))
-                priority = [by_name[w] for w in wanted]
-                candidate = self._grouping_for(priority)
-                saved = self.groups
-                self.groups = candidate
-                try:
-                    total = self.autosize_trials(block)
-                except ValueError as e:
-                    # Reject the candidate rather than aborting the whole block:
-                    # the user can still pick a grouping that reconciles.
-                    self.groups = saved
-                    total = self.autosize_trials(block)
-                    print("That grouping cannot be reconciled: {}".format(e))
-                    continue
-                chosen = priority
-                demoted = [str(g[0].name) for g in candidate
-                           if len(g) == 1 and g[0] not in priority]
-                if demoted:
-                    print("That gives {} trials. ({}: each level appears at least "
-                          "once)".format(total, ", ".join(demoted)))
-                else:
-                    print("That gives {} trials.".format(total))
-        except _NoInput:
-            self.groups = [self.factors]
-            total = self.autosize_trials(block)
-            warnings.warn("CoverAllCombinations: no interactive input available, so the "
-                          "prioritize=True prompt was skipped; using the computed trial "
-                          "count of {}".format(total))
-            return total
-        if chosen is not None:
-            # An interactive design is otherwise unreproducible: re-running the
-            # script re-prompts, and the result depends on what was typed.
-            print("\nTo skip this prompt next time:\n    CoverAllCombinations({}, "
-                  "prioritize=[{}])".format(", ".join(str(f.name) for f in self.factors),
-                                            ", ".join(str(f.name) for f in chosen)))
-        return total
+        Demoted factors come from `prioritize` rather than from group sizes: a
+        single prioritized factor leaves the kept group a singleton too, so
+        group size cannot tell kept from demoted."""
+        msg = "{} requires {} trials.".format(repr(self), total)
+        demoted = [str(f.name) for f in self.factors if f not in self.prioritize]
+        if self.prioritize and demoted:
+            msg += " ({}: each level appears at least once)".format(", ".join(demoted))
+        return msg
 
     @staticmethod
     def _k_lower_bound(R_free, slots, slot_weights=None):
@@ -1798,8 +1731,7 @@ class CoverAllCombinations(Constraint):
         def replace(fs):
             return [replacements.get(f, [f, f])[1] for f in fs]
         c = CoverAllCombinations(*replace(self.factors))
-        c.prioritize = (replace(self.prioritize)
-                        if isinstance(self.prioritize, list) else self.prioritize)
+        c.prioritize = replace(self.prioritize)
         # Groups hold the same Factor objects as `factors`, so they need the
         # same mapping: otherwise a weighted design keeps pre-desugar factors
         # here and coverage is computed against factors the block no longer has.
@@ -1868,9 +1800,7 @@ class CoverAllCombinations(Constraint):
 
     def __repr__(self):
         args = [f.name for f in self.factors]
-        if isinstance(self.prioritize, list):
+        if self.prioritize:
             args.append("prioritize=[{}]".format(
                 ", ".join(f.name for f in self.prioritize)))
-        elif self.prioritize:
-            args.append("prioritize=True")
         return "CoverAllCombinations({})".format(", ".join(args))
