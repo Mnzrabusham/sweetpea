@@ -1274,75 +1274,58 @@ def _val_name(x):
 
 class CoverAllCombinations(Constraint):
     """Requires that the trials of an experiment collectively include every realizable
-    combination of `factors` at least once, or a weaker requirement where
-    `prioritize` names only some of them.
+    combination of `factors` at least once, plus a weaker requirement for each
+    factor named in `optional`.
 
     Factors left out of a crossing are otherwise assigned freely by the solver; this
     constraint coordinates those free choices so that the union of all trials covers
     every combination. The number of trials needed is computed automatically and the
     block is grown to fit (see the auto-sizing notes on the block constructors).
 
-    The two arguments do different jobs: `factors` sets what the constraint
-    governs, and `prioritize` sets how strongly. A factor named in `prioritize`
-    must appear in combination with the others named there; a factor left out of
-    it needs only each of its own levels to appear somewhere, in no particular
-    combination. Naming none of them---the default---requires every combination
-    of `factors`, and naming a subset trades coverage for a shorter experiment.
+    The two groups carry different guarantees. The positional `factors` must
+    appear in combination with one another---every combination of their levels.
+    A factor named in `optional` needs only each of its own levels to appear
+    somewhere, in no particular combination, which trades coverage for a shorter
+    experiment. A factor may not be in both groups.
 
     Usage::
 
         Nest(outer, inner, [CoverAllCombinations(color, word)])
         CrossBlock(design, crossing, [CoverAllCombinations(color, word)])
-        CrossBlock(design, crossing, [CoverAllCombinations(color, word, cue,
-                                                           prioritize=[color, word])])
+        CrossBlock(design, crossing, [CoverAllCombinations(color, word,
+                                                           optional=[cue])])
     """
 
-    def __init__(self, *factors, prioritize=[]):
+    def __init__(self, *factors, optional=[]):
         who = "CoverAllCombinations"
-        factor_list = list(factors)
-        if factor_list == []:
-            raise ValueError(who, "factor list must be non-empty")
-        argcheck(who, factor_list, make_islistof(Factor), "factors")
-        self.factors = factor_list
+        required = list(factors)
+        argcheck(who, required, make_islistof(Factor), "factors")
         # Checked before list(), so that a non-iterable (e.g. a stray boolean)
         # reports the parameter by name instead of raising from the conversion.
-        argcheck(who, prioritize, make_islistof(Factor), "prioritize")
-        priority = list(prioritize)
-        self._check_priority(priority, who)
-        self.prioritize = priority
-        # Coverage requirements, one fully-crossed combination set per group.
-        # The lone default group is the full cross of `factors`; a priority list
-        # splits it into the kept group plus a singleton per demoted factor.
-        self.groups = (self._grouping_for(priority) if priority
-                       else cast(List[List[Factor]], [factor_list]))
+        argcheck(who, optional, make_islistof(Factor), "optional")
+        self.required = required
+        self.optional = cast(List[Factor], [])
+        for f in optional:
+            if f in required:
+                raise ValueError((who,
+                                  "'{}' is both required and optional; a factor belongs "
+                                  "to one group or the other".format(f.name)))
+            if f not in self.optional:
+                self.optional.append(f)
+        # Every factor the constraint governs, whichever guarantee it carries.
+        self.factors = self.required + self.optional
+        if self.factors == []:
+            raise ValueError(who, "factor list must be non-empty")
+        # Coverage requirements, one fully-crossed combination set per group:
+        # the required factors together, then each optional factor on its own so
+        # that only its individual levels have to appear.
+        self.groups = cast(List[List[Factor]],
+                           ([required] if required else [])
+                           + [[f] for f in self.optional])
         # Set by Nest during construction: the inner block whose crossing determines
         # which listed factors are pinned vs. free. None for other block types, in
         # which case the attached block itself is analyzed.
         self._inner_block = cast(Optional[MultiCrossBlockRepeat], None)
-
-    # ~~~~~~~~~~~~~~ Priority grouping ~~~~~~~~~~~~~~
-
-    def _check_priority(self, priority, who) -> None:
-        for f in priority:
-            if f not in self.factors:
-                raise ValueError((who,
-                                  "'{}' is not one of the factors listed in the constraint "
-                                  "({})".format(f.name,
-                                                ", ".join(g.name for g in self.factors))))
-
-    def _grouping_for(self, priority) -> List[List[Factor]]:
-        """Groups for a priority list: the named factors form one fully-crossed
-        group, and each remaining listed factor becomes a group of its own, so
-        only its individual levels are required to appear.
-
-        An empty priority list demotes everything, which is the cheapest
-        grouping; naming every factor reproduces the default single group."""
-        kept = []  # type: List[Factor]
-        for f in priority:
-            if f not in kept:
-                kept.append(f)
-        demoted = [f for f in self.factors if f not in kept]
-        return ([kept] if kept else []) + [[f] for f in demoted]
 
     # ~~~~~~~~~~~~~~ Coverage analysis (the "K" computation) ~~~~~~~~~~~~~~
 
@@ -1633,15 +1616,11 @@ class CoverAllCombinations(Constraint):
                           "the other constraints ({})".format(cap, ", ".join(conflicting))))
 
     def sizing_message(self, total) -> str:
-        """The line a block reports as it grows itself for coverage.
-
-        Demoted factors come from `prioritize` rather than from group sizes: a
-        single prioritized factor leaves the kept group a singleton too, so
-        group size cannot tell kept from demoted."""
+        """The line a block reports as it grows itself for coverage."""
         msg = "{} requires {} trials.".format(repr(self), total)
-        demoted = [str(f.name) for f in self.factors if f not in self.prioritize]
-        if self.prioritize and demoted:
-            msg += " ({}: each level appears at least once)".format(", ".join(demoted))
+        if self.optional:
+            msg += " ({}: each level appears at least once)".format(
+                ", ".join(str(f.name) for f in self.optional))
         return msg
 
     @staticmethod
@@ -1730,12 +1709,11 @@ class CoverAllCombinations(Constraint):
     def desugar(self, replacements: dict) -> List[Constraint]:
         def replace(fs):
             return [replacements.get(f, [f, f])[1] for f in fs]
-        c = CoverAllCombinations(*replace(self.factors))
-        c.prioritize = replace(self.prioritize)
-        # Groups hold the same Factor objects as `factors`, so they need the
-        # same mapping: otherwise a weighted design keeps pre-desugar factors
-        # here and coverage is computed against factors the block no longer has.
-        c.groups = [replace(g) for g in self.groups]
+        # Rebuilding through the constructor re-derives the groups from the
+        # mapped factors, so no group can keep a pre-desugar factor that the
+        # block no longer has.
+        c = CoverAllCombinations(*replace(self.required),
+                                 optional=replace(self.optional))
         c._inner_block = self._inner_block
         return [c]
 
@@ -1799,8 +1777,8 @@ class CoverAllCombinations(Constraint):
         return True
 
     def __repr__(self):
-        args = [f.name for f in self.factors]
-        if self.prioritize:
-            args.append("prioritize=[{}]".format(
-                ", ".join(f.name for f in self.prioritize)))
+        args = [f.name for f in self.required]
+        if self.optional:
+            args.append("optional=[{}]".format(
+                ", ".join(f.name for f in self.optional)))
         return "CoverAllCombinations({})".format(", ".join(args))

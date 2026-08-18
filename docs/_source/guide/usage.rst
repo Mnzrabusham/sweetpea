@@ -1345,28 +1345,31 @@ reported as the block is built, so it is visible without asking for it.
     >>> tb.trials_per_sample()
     12
 
-The `prioritize` argument names the factors to keep fully crossed. The
-remaining listed factors are demoted: each of their levels must still
-appear at least once, but their combinations with the other factors
-are no longer required. Keeping `colr` and `size` crossed brings the
-same design down to four trials, and the report names what was demoted.
+The `optional` argument names factors that need only each of their own
+levels to appear, in no particular combination. The factors given
+positionally keep the full requirement, so each factor is classified
+once. Making `cue` optional brings the same design down to four trials,
+and the report names what was made optional.
 
   .. doctest::
 
     >>> pb = CrossBlock(design=design, crossing=[task],
-    ...                 constraints=[CoverAllCombinations(colr, size, cue,
-    ...                                                   prioritize=[colr, size])])
-    CoverAllCombinations(colr, size, cue, prioritize=[colr, size]) requires 4 trials. (cue: each level appears at least once)
+    ...                 constraints=[CoverAllCombinations(colr, size,
+    ...                                                   optional=[cue])])
+    CoverAllCombinations(colr, size, optional=[cue]) requires 4 trials. (cue: each level appears at least once)
     >>> pb.trials_per_sample()
     4
 
 All four `colr`-`size` combinations still appear and all three `cue`
 levels still appear, but the twelve three-way combinations no longer
-have to. To choose differently, change the `prioritize` list and build
-the block again.
+have to. To choose differently, move factors between the two groups and
+build the block again.
+
+A factor may not be in both groups, since it cannot both require its
+combinations and give them up.
 
 Listing the same factors in two separate constraints expresses the
-same thing without the `prioritize` argument, since each constraint is
+same thing without the `optional` argument, since each constraint is
 sized on its own and the block takes the larger count.
 
   .. doctest::

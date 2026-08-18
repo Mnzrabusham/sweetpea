@@ -291,7 +291,7 @@ def test_unmodeled_conflict_yields_hint(capsys):
     assert 'AtLeastKInARow' in out
 
 
-# ~~~~~~~~~~~~ Coverage/trials tradeoff (prioritize) ~~~~~~~~~~~~
+# ~~~~~~~~~~~~ Coverage/trials tradeoff (required vs optional) ~~~~~~~~~~~~
 
 def _trio():
     """`task` is crossed while colr, size, and cue ride free, so covering all
@@ -304,48 +304,52 @@ def _trio():
     return colr, size, cue, task
 
 
-def _trio_block(colr, size, cue, task, listed=None, **kw):
-    listed = listed if listed is not None else [colr, size, cue]
+def _trio_block(colr, size, cue, task, required=None, **kw):
+    """All three factors required by default, which is full coverage."""
+    required = [colr, size, cue] if required is None else required
     return CrossBlock(design=[task, colr, size, cue], crossing=[task],
-                      constraints=[CoverAllCombinations(*listed, **kw)])
+                      constraints=[CoverAllCombinations(*required, **kw)])
 
 
-@pytest.mark.parametrize('kw', [{}, {'prioritize': []}])
-def test_prioritize_empty_keeps_full_coverage(kw):
+@pytest.mark.parametrize('kw', [{}, {'optional': []}])
+def test_no_optional_keeps_full_coverage(kw):
     colr, size, cue, task = _trio()
     assert _trio_block(colr, size, cue, task, **kw).trials_per_sample() == 12
 
 
-def test_prioritize_reduces_trials():
+def test_optional_reduces_trials():
     # colr x size needs 2 passes and cue's 3 levels need 2, so K = 2.
     colr, size, cue, task = _trio()
-    block = _trio_block(colr, size, cue, task, prioritize=[colr, size])
+    block = _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
     assert block.trials_per_sample() == 4
 
 
-def test_prioritize_every_factor_is_full_coverage():
+def test_optional_ignores_duplicates():
     colr, size, cue, task = _trio()
-    block = _trio_block(colr, size, cue, task, prioritize=[colr, size, cue])
-    assert block.trials_per_sample() == 12
-
-
-def test_prioritize_ignores_duplicates():
-    colr, size, cue, task = _trio()
-    block = _trio_block(colr, size, cue, task, prioritize=[colr, colr, size])
+    block = _trio_block(colr, size, cue, task, required=[colr, size],
+                        optional=[cue, cue])
     assert block.trials_per_sample() == 4
 
 
-def test_prioritize_demoting_crossed_factor_is_harmless():
-    # `task` is crossed, so its singleton group is satisfied by every pass.
+def test_optional_crossed_factor_is_harmless():
+    # `task` is crossed, so its group is satisfied by every pass.
     colr, size, cue, task = _trio()
-    block = _trio_block(colr, size, cue, task, listed=[task, colr, size, cue],
-                        prioritize=[colr, size])
+    block = _trio_block(colr, size, cue, task, required=[colr, size],
+                        optional=[task, cue])
     assert block.trials_per_sample() == 4
 
 
-def test_prioritize_keeps_both_guarantees():
+def test_optional_without_any_required_factors():
+    # Nothing has to be covered in combination; each cue level just has to
+    # appear, which two passes can hold.
     colr, size, cue, task = _trio()
-    block = _trio_block(colr, size, cue, task, prioritize=[colr, size])
+    block = _trio_block(colr, size, cue, task, required=[], optional=[cue])
+    assert block.trials_per_sample() == 4
+
+
+def test_optional_keeps_both_guarantees():
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
     exps = synthesize_trials(block, 1, sampling_strategy=IterateGen)
     assert exps
     for e in exps:
@@ -355,7 +359,7 @@ def test_prioritize_keeps_both_guarantees():
 
 
 def test_two_coverage_constraints_take_the_larger():
-    # Two constraints express the same thing as prioritize=[colr, size].
+    # Two constraints express the same thing as optional=[cue].
     colr, size, cue, task = _trio()
     block = CrossBlock(design=[task, colr, size, cue], crossing=[task],
                        constraints=[CoverAllCombinations(colr, size),
@@ -369,27 +373,32 @@ def test_two_coverage_constraints_take_the_larger():
         assert set(e['cue']) == {'c1', 'c2', 'c3'}
 
 
-def test_prioritize_unknown_factor_raises():
+def test_factor_cannot_be_required_and_optional():
     colr, size, cue, task = _trio()
+    with pytest.raises(ValueError, match='both required and optional'):
+        CoverAllCombinations(colr, size, optional=[size])
+
+
+def test_no_factors_at_all_raises():
     with pytest.raises(ValueError):
-        CoverAllCombinations(colr, size, prioritize=[cue])
+        CoverAllCombinations()
 
 
-def test_prioritize_rejects_a_bool():
+def test_optional_rejects_a_bool():
     colr, size, cue, task = _trio()
-    with pytest.raises(ValueError, match='prioritize'):
-        CoverAllCombinations(colr, size, cue, prioritize=True)
+    with pytest.raises(ValueError, match='optional'):
+        CoverAllCombinations(colr, size, cue, optional=True)
 
 
-def test_prioritize_repr_shows_the_choice():
+def test_repr_shows_the_groups():
     colr, size, cue, task = _trio()
-    assert repr(CoverAllCombinations(colr, size, cue, prioritize=[colr, size])) == \
-        'CoverAllCombinations(colr, size, cue, prioritize=[colr, size])'
-    assert repr(CoverAllCombinations(colr, size, cue)) == \
-        'CoverAllCombinations(colr, size, cue)'
+    assert (repr(CoverAllCombinations(colr, size, optional=[cue]))
+            == 'CoverAllCombinations(colr, size, optional=[cue])')
+    assert (repr(CoverAllCombinations(colr, size, cue))
+            == 'CoverAllCombinations(colr, size, cue)')
 
 
-def test_prioritize_in_nest():
+def test_optional_in_nest():
     colors, color, word, congruency, _ = _stroop(3)
     cue = Factor('cue', ['c1', 'c2', 'c3', 'c4'])
     inner = CrossBlock([congruency, color, word, cue], [congruency, color], [])
@@ -399,20 +408,19 @@ def test_prioritize_in_nest():
     # own 8 word-cue combinations, so K = 8 over passes of 6.
     full = Nest(outer, inner, [CoverAllCombinations(color, word, cue)])
     assert full.trials_per_sample() == 48
-    # Demoting cue leaves the 6 free color-word pairs over 3 slots: K = 2.
+    # Making cue optional leaves the 6 free color-word pairs over 3 slots: K = 2.
     fewer = Nest(outer, inner,
-                 [CoverAllCombinations(color, word, cue, prioritize=[color, word])])
+                 [CoverAllCombinations(color, word, optional=[cue])])
     assert fewer.trials_per_sample() == 12
 
 
-def test_prioritize_with_weighted_crossing():
+def test_optional_with_weighted_crossing():
     # Weighted levels on the crossed factor still size correctly once some of
-    # the listed factors are demoted.
+    # the governed factors are optional.
     colors, color, word, congruency = _stroop_weighted(4, 2)
     cue = Factor('cue', ['c1', 'c2', 'c3'])
     block = CrossBlock([congruency, color, word, cue], [congruency, color],
-                       [CoverAllCombinations(color, word, cue,
-                                             prioritize=[color, word])])
+                       [CoverAllCombinations(color, word, optional=[cue])])
     exps = synthesize_trials(block, 1, sampling_strategy=IterateGen)
     assert exps
     for e in exps:
@@ -427,23 +435,21 @@ def test_reports_the_count_under_full_coverage(capsys):
     _trio_block(colr, size, cue, task)
     out = capsys.readouterr().out
     assert 'CoverAllCombinations(colr, size, cue) requires 12 trials.' in out
-    # Nothing was demoted, so nothing is said about individual levels.
+    # Nothing is optional, so nothing is said about individual levels.
     assert 'each level appears' not in out
 
 
-def test_reports_the_count_and_demotions_under_prioritize(capsys):
+def test_reports_the_count_and_optional_factors(capsys):
     colr, size, cue, task = _trio()
-    _trio_block(colr, size, cue, task, prioritize=[colr, size])
+    _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
     out = capsys.readouterr().out
-    assert ('CoverAllCombinations(colr, size, cue, prioritize=[colr, size]) '
-            'requires 4 trials. (cue: each level appears at least once)') in out
+    assert ('CoverAllCombinations(colr, size, optional=[cue]) requires 4 trials. '
+            '(cue: each level appears at least once)') in out
 
 
-def test_reports_demotions_for_a_single_prioritized_factor(capsys):
-    # Every group is a singleton here, so group size cannot tell the kept
-    # factor from the demoted ones; the report comes from `prioritize`.
+def test_reports_every_optional_factor(capsys):
     colr, size, cue, task = _trio()
-    _trio_block(colr, size, cue, task, prioritize=[colr])
+    _trio_block(colr, size, cue, task, required=[colr], optional=[size, cue])
     out = capsys.readouterr().out
     assert '(size, cue: each level appears at least once)' in out
 

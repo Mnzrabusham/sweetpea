@@ -142,13 +142,13 @@ Constraints
               :type factors: List[Factor]
               :rtype: Constraint
 
-.. class:: sweetpea.CoverAllCombinations(*factors, prioritize=[])
+.. class:: sweetpea.CoverAllCombinations(*factors, optional=[])
 
               Constrains an experiment so that its trials collectively
               include every realizable combination of the levels of
-              `factors` at least once, or a weaker requirement where
-              `prioritize` names only some of them. A factor that is
-              left out of a crossing is otherwise assigned freely by the
+              `factors` at least once, plus a weaker requirement for
+              each factor named in `optional`. A factor that is left
+              out of a crossing is otherwise assigned freely by the
               solver, so nothing normally guarantees that a particular
               combination ever appears; this constraint coordinates
               those free choices.
@@ -176,32 +176,28 @@ Constraints
               weighted levels elsewhere in the crossing are supported,
               and they change the trial count accordingly.
 
-              The two arguments do different jobs: `factors` sets what
-              the constraint governs, and `prioritize` sets how
-              strongly. A factor named in `prioritize` must appear in
-              combination with the others named there; a factor left out
-              of it needs only each of its own levels to appear
-              somewhere, in no particular combination. Naming none of
-              them---the default---requires every combination of
-              `factors`. Since the required set is the product of the
-              levels involved, naming a subset trades coverage for a
-              shorter experiment.
+              The two groups carry different guarantees. The
+              positional `factors` must appear in combination with one
+              another---every combination of their levels. A factor
+              named in `optional` needs only each of its own levels to
+              appear somewhere, in no particular combination. Since the
+              required set is the product of the levels involved,
+              moving a factor to `optional` trades coverage for a
+              shorter experiment. A factor may not be in both groups.
 
               The number of trials required is printed as the block is
-              built, along with any factors that were demoted.
+              built, along with any factors that were made optional.
 
               See :ref:`Covering All Combinations <covering-all-combinations>`
               for more information.
 
-              :param factors: the factors this constraint governs; any
-                              factor not listed here is unaffected by it
+              :param factors: the factors that must appear in
+                              combination with one another
               :type factors: Factor
-              :param prioritize: which of `factors` must appear in
-                                 combination with one another; those left
-                                 out need only each of their own levels to
-                                 appear. Empty requires every combination
-                                 of `factors`.
-              :type prioritize: List[Factor]
+              :param optional: further factors the constraint governs,
+                               each needing only its own levels to
+                               appear rather than its combinations
+              :type optional: List[Factor]
               :rtype: Constraint
 
 .. class:: sweetpea.ContinuousConstraint(factors, predicate)
