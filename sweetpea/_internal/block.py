@@ -78,6 +78,9 @@ class Block:
         self.excluded_derived = cast(List[Dict[Factor, SimpleLevel]], [])
         self.require_complete_crossing = require_complete_crossing
         self.errors = cast(Set[str], set())
+        # Filled in by coverage sizing when `Relax` authorizes a widening;
+        # reported as the block is built and again with the results.
+        self.applied_relaxations = cast(List[str], [])
         self.act_design = list(filter(lambda f: not self.factor_is_implied(f), self.design))
         self._trials_per_sample = None
         self._simple_tuples = cast(Optional[List[Tuple[Factor, Union[SimpleLevel, DerivedLevel]]]], None)

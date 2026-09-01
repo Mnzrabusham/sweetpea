@@ -91,11 +91,20 @@ class MultiCrossBlockRepeat(Block):
 
         crossings = [c for c in crossings if len(c) > 0]
 
-        from sweetpea._internal.constraint import Cross, Consistency, Sustain, CoverAllCombinations
+        from sweetpea._internal.constraint import (Cross, Consistency, Sustain,
+                                                   CoverAllCombinations, _KInARow)
         from sweetpea._internal.derivation_processor import DerivationProcessor
         self.orig_design = design
         self.orig_crossings = crossings
         self.orig_constraints = constraints
+        # Counted before desugaring, so a whole-factor Relax stays the one
+        # constraint the user wrote rather than one per level.
+        relaxed = [c for c in constraints
+                   if isinstance(c, _KInARow) and c.relaxation is not None]
+        if len(relaxed) > 1:
+            raise ValueError((who,
+                              "an experiment may relax one constraint, but {} were "
+                              "given to Relax".format(len(relaxed))))
         design, crossings, replacements = _desugar_factors_with_weights(design, crossings)
         all_constraints = cast(List[Constraint], [Cross(), Consistency()]) + constraints
         if any(count != 1 for count in crossing_sustain_counts):
@@ -119,7 +128,12 @@ class MultiCrossBlockRepeat(Block):
         # needed for coverage. Must run before trials_per_sample() is first cached.
         for ct in self.constraints:
             if isinstance(ct, CoverAllCombinations):
-                target = ct.autosize_trials(self)
+                reported = len(self.applied_relaxations)
+                target = ct.reconcile_trials(self)
+                for message in self.applied_relaxations[reported:]:
+                    # Ahead of the trial count: the widening is what makes that
+                    # count reachable.
+                    print(message)
                 if target > 0:
                     # Report what coverage costs, rather than the block's final
                     # length: MinimumTrials and sustain rounding can lengthen it

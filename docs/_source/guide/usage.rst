@@ -1381,3 +1381,84 @@ sized on its own and the block takes the larger count.
     CoverAllCombinations(cue) requires 4 trials.
     >>> sb.trials_per_sample()
     4
+
+
+.. _relaxing-a-constraint:
+
+Relaxing a Constraint
+---------------------
+
+A constraint can conflict with what :class:`.CoverAllCombinations`
+requires. Crossing `color` alone over three colors gives nine trials
+that hold each `color`-`word` combination once, so `word` is `red` in
+three of them. An :class:`.ExactlyK` constraint allowing two such
+trials contradicts that, and the block reports the conflict and stops.
+
+:func:`.Relax` authorizes a constraint to be weakened instead. It takes
+the constraint and a budget, and returns a copy to use in its place.
+Coverage sizing then computes the value the constraint has to take and
+adjusts it, provided the change stays within the budget.
+
+  .. doctest::
+
+    >>> from sweetpea import Factor, CrossBlock, CoverAllCombinations, ExactlyK, Relax
+    >>> color = Factor("color", ["red", "green", "blue"])
+    >>> word  = Factor("word",  ["red", "green", "blue"])
+    >>> cap = Relax(ExactlyK(2, (word, "red")), by=1)
+    >>> rb = CrossBlock(design=[color, word], crossing=[color],
+    ...                 constraints=[CoverAllCombinations(color, word), cap])
+    ExactlyK for 'word red' relaxed from 2 to 3, as CoverAllCombinations(color, word) requires.
+    CoverAllCombinations(color, word) requires 9 trials.
+    >>> rb.trials_per_sample()
+    9
+
+The value that was applied is also available on the constraint, for a
+script that needs to record what the experiment actually required.
+
+  .. doctest::
+
+    >>> cap.relaxation.original_k, cap.relaxation.applied_k
+    (2, 3)
+
+`by` is a budget, not a target. The constraint's `k` may end up
+anywhere within `by` of the value written, and the adjustment applied
+is the smallest one that resolves the conflict. A constraint that is
+already consistent with coverage is left alone, whether or not it was
+relaxed. When the required value lies outside the budget, the block
+reports the value it would need and stops rather than exceeding what
+was authorized.
+
+Weakening is never inferred. A constraint that was not passed through
+:func:`.Relax` keeps its stated value, and a conflict involving it
+remains an error. Every adjustment that is applied is printed as the
+block is built and repeated by :func:`.print_experiments`, so it
+appears alongside the trial sequences it produced.
+
+Weakening After the Solver
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:class:`.AtMostKInARow` and :class:`.AtLeastKInARow` can also be
+relaxed. They govern the order of trials rather than a count, so
+coverage sizing cannot work out the value they must take, and no
+adjustment is made until the solver reports that the design has no
+solution. SweetPea then moves `k` one step at a time towards the weaker
+requirement---a larger `k` for :class:`.AtMostKInARow`, a smaller one
+for :class:`.AtLeastKInARow`---re-solving after each step and stopping
+at the first value that works.
+
+::
+
+    block = CrossBlock(design=[color, word], crossing=[color],
+                       constraints=[Relax(AtMostKInARow(1, (color, "red")), by=2)])
+
+`k` never falls below one, so an :class:`.AtLeastKInARow` already at
+one has no room to move. If the budget runs out before a solution is
+found, the constraint is restored to the value written and no trial
+sequences are returned.
+
+An experiment may relax one constraint. Weakening is only attempted
+when the solver reports the design unsatisfiable; a solver that fails
+to answer says nothing about the design, so nothing is adjusted.
+
+Constraints other than these three cannot be relaxed, and passing one
+to :func:`.Relax` raises an error.

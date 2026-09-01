@@ -105,6 +105,37 @@ Constraints
               :type level: Union[Level, Tuple[Factor, Any], Tuple[Factor, Level], Factor]
               :rtype: Constraint
 
+.. function:: sweetpea.Relax(constraint, by)
+
+              Authorizes `constraint` to be weakened by up to `by`,
+              when it would otherwise leave the experiment with no
+              satisfying trial sequences. Returns a copy of
+              `constraint` to use in place of the original; the
+              constraint passed in is unchanged.
+
+              A constraint is weakened only when it is passed through
+              this function, and any adjustment that is applied is
+              reported as the experiment runs and again by
+              :func:`.print_experiments`. An experiment may relax one
+              constraint.
+
+              :class:`.ExactlyK`, :class:`.AtMostKInARow` and
+              :class:`.AtLeastKInARow` can be relaxed; passing any
+              other constraint raises an error. An :class:`.ExactlyK`
+              is adjusted while the block is sized, where
+              :class:`.CoverAllCombinations` can compute the value it
+              must take. The in-a-row constraints have no such model,
+              so they are adjusted only after the solver reports that
+              the design has no solution. See
+              :ref:`relaxing-a-constraint`.
+
+              :param constraint: the constraint that may be weakened
+              :type constraint: Constraint
+              :param by: how many steps the constraint's `k` may move
+                         towards the weaker requirement
+              :type by: int
+              :rtype: Constraint
+
 .. class:: sweetpea.Sequential(factor)
 
               Constrains the experiment so that the levels of `factor`

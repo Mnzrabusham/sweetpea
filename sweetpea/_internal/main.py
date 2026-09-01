@@ -18,6 +18,7 @@ __all__ = [
 
     'Constraint', 
     'Exclude', 'Pin', 'MinimumTrials', 'ExactlyK',
+    'Relax',
     'AtMostKInARow', 'AtLeastKInARow',
     'ExactlyKInARow',
     'LatinSquare',
@@ -53,10 +54,13 @@ from sweetpea._internal.constraint import (
     Consistency, Constraint, Derivation,
     Exclude, Pin, MinimumTrials,
     ExactlyK, AtMostKInARow, AtLeastKInARow, ExactlyKInARow,
+    Relax,
     LatinSquare,
     Sequential,
-    CoverAllCombinations
+    CoverAllCombinations,
+    solver_relaxable, relax_budget
 )
+from sweetpea._internal.core import SolveOutcome
 from sweetpea._internal.sampling_strategy.base import Gen
 from sweetpea._internal.sampling_strategy.uniform import UniformGen
 from sweetpea._internal.sampling_strategy.iterate import IterateGen
@@ -179,6 +183,8 @@ def print_experiments(block, experiments):
             ls_name = ct.name
             ls_dlen = ct.diagonal_length()
 
+    for message in block.applied_relaxations:
+        print(message)
     print('\n{} trial sequences found.\n'.format(len(experiments)))
     for idx, e in enumerate(experiments):
         print('Experiment {}:'.format(idx))
@@ -394,13 +400,17 @@ def synthesize_trials(block: Block,
         # type: (Any) -> None
         print("Sampling {} trial sequences using {}.".format(samples, who))
 
+    def run():
+        if isinstance(sampling_strategy, type):
+            return sampling_strategy.sample(block, samples)
+        return sampling_strategy.sample_object(block, samples)
+
     if isinstance(sampling_strategy, type):
         assert issubclass(sampling_strategy, Gen)
         starting(sampling_strategy.class_name())
-        sampling_result = sampling_strategy.sample(block, samples)
     else:
         starting(sampling_strategy)
-        sampling_result = sampling_strategy.sample_object(block, samples)
+    sampling_result = _weaken_until_satisfiable(block, run(), run)
 
     # DW: I am not sure if I need to fix this. Need to discuss with Matthew
     raw_samples = sampling_result.samples[:samples]
@@ -428,23 +438,66 @@ def synthesize_trials(block: Block,
         # Restore ContinuousFactor to the design
 
     if not trialss:
-        # With a coverage constraint, an empty result means the solver found the
-        # joint constraints unsatisfiable. Point at the constraints that coverage
-        # auto-sizing cannot account for (ordering constraints and LatinSquare).
-        from sweetpea._internal.constraint import _KInARow
-        cacs = [ct for ct in block.orig_constraints if isinstance(ct, CoverAllCombinations)]
-        if cacs:
-            msg = ("No trial sequences found: the constraints could not be satisfied "
-                   "together with " + " and ".join(repr(ct) for ct in cacs) + ".")
-            unmodeled = sorted(set(type(ct).__name__ for ct in block.orig_constraints
-                                   if isinstance(ct, (_KInARow, LatinSquare))))
-            if unmodeled:
-                msg += (" Constraints of kind " + ", ".join(unmodeled)
-                        + " are not folded into coverage auto-sizing; a MinimumTrials"
-                          " constraint can provide additional trials.")
-            print(msg)
+        print(_no_sequences_message(block, sampling_result.outcome))
 
     return trialss
+
+
+def _weaken_until_satisfiable(block, result, run):
+    """Step the block's one `Relax`-authorized constraint until the design has a
+    solution or its budget runs out, re-solving after each step.
+
+    Only a definitive UNSATISFIABLE justifies this. An unknown outcome means the
+    solver failed, which is no reason to alter the experiment."""
+    constraint = solver_relaxable(block)
+    if result.outcome is not SolveOutcome.UNSATISFIABLE or constraint is None:
+        return result
+    relaxation = constraint.relaxation
+    written = relaxation.base_k(constraint.k)
+    for _ in range(relax_budget(constraint)):
+        constraint.k += constraint.weaken_step
+        print("No solution; retrying with {}(k={}).".format(
+            type(constraint).__name__, constraint.k))
+        result = run()
+        if result.samples:
+            relaxation.original_k = written
+            relaxation.applied_k = constraint.k
+            block.applied_relaxations.append(
+                "{} for '{} {}' relaxed from {} to {}, as the solver found no "
+                "solution otherwise.".format(
+                    type(constraint).__name__, constraint.level.factor.name,
+                    constraint.level.name, written, constraint.k))
+            return result
+    constraint.k = written
+    return result
+
+
+def _no_sequences_message(block, outcome) -> str:
+    """Why nothing came back, taken from the solver's answer rather than
+    inferred from the empty list."""
+    from sweetpea._internal.constraint import _KInARow
+    if outcome is SolveOutcome.UNKNOWN:
+        return ("No trial sequences found: the solver gave no answer, so this "
+                "reports a solver failure rather than the design.")
+    relaxed = solver_relaxable(block)
+    if relaxed is not None:
+        return ("No trial sequences found: the design has no solution, and "
+                "weakening {} by up to {} was not enough."
+                .format(type(relaxed).__name__, relaxed.relaxation.by))
+    cacs = [ct for ct in block.orig_constraints if isinstance(ct, CoverAllCombinations)]
+    if not cacs:
+        return "No trial sequences found: the design has no solution."
+    # Coverage auto-sizing cannot account for ordering constraints or
+    # LatinSquare, so name those as the likely conflict.
+    msg = ("No trial sequences found: the constraints could not be satisfied "
+           "together with " + " and ".join(repr(ct) for ct in cacs) + ".")
+    unmodeled = sorted(set(type(ct).__name__ for ct in block.orig_constraints
+                           if isinstance(ct, (_KInARow, LatinSquare))))
+    if unmodeled:
+        msg += (" Constraints of kind " + ", ".join(unmodeled)
+                + " are not folded into coverage auto-sizing; a MinimumTrials"
+                  " constraint can provide additional trials.")
+    return msg
 
 def sample_mismatch_experiment(block: Block, sample: dict) -> dict:
     """Given an experiment described with a :class:`.Block`, tests if :class:`list`

@@ -8,6 +8,7 @@ from math import factorial, ceil
 from typing import List, cast, Tuple, Dict, Optional, Union, Any
 
 from sweetpea._internal.block import Block
+from sweetpea._internal.core import SolveOutcome
 from sweetpea._internal.cross_block import CrossBlock
 from sweetpea._internal.combinatorics import (
     n_choose_m,
@@ -66,7 +67,9 @@ class RandomGen(Gen):
         metrics['solution_count'] = enumerator.solution_count()
 
         if (enumerator.solution_count() == 0):
-            return SamplingResult([], metrics)
+            # Exact enumeration, so this is a definitive answer about the design
+            # rather than a sampling run that came up empty.
+            return SamplingResult([], metrics, SolveOutcome.UNSATISFIABLE)
 
         crossing_size = enumerator.crossing_size # includes crossing weight
 
@@ -125,7 +128,7 @@ class RandomGen(Gen):
         if (total_rejected > 10000):
             print("")
 
-        return SamplingResult(samples, metrics)
+        return SamplingResult(samples, metrics, SolveOutcome.SATISFIED)
 
     @staticmethod
     def __are_constraints_violated(block: CrossBlock, sample: dict, enumerator: 'UCSolutionEnumerator',

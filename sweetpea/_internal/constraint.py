@@ -2,7 +2,7 @@
 
 import operator as op
 from abc import abstractmethod
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import List, Tuple, Any, Union, cast, Dict, Callable, Optional
 from itertools import chain, product
 from math import ceil
@@ -382,10 +382,16 @@ class Derivation(Constraint):
 
 
 class _KInARow(Constraint):
+    #: How `k` moves to weaken this constraint: +1 raises it, -1 lowers it.
+    #: Zero means the solver loop cannot step it.
+    weaken_step = 0
+
     def __init__(self, k, level):
         self.k = k
         self.level = level
         self.within_block = cast(Optional[BlockGeometry], None)
+        # Set by `Relax`; None means the constraint is binding.
+        self.relaxation = cast(Optional['_Relaxation'], None)
         self.__validate()
 
     def __validate(self) -> None:
@@ -517,6 +523,9 @@ class AtMostKInARow(_KInARow):
         sum(1, 7, 13)  LT 3
         sum(7, 13, 19) LT 3
     """
+    # Longer runs are the weaker requirement.
+    weaken_step = 1
+
     def apply_to_backend_request(self, block: Block, level: Tuple[Factor, Union[SimpleLevel, DerivedLevel]], backend_request: BackendRequest) -> None:
         sublistss = self._build_variable_sublistss(block, level, self.k + 1)
         # Build the requests
@@ -559,6 +568,9 @@ class AtLeastKInARow(_KInARow):
         If(And(!1, 7)) Then (13, 19)
         If(19) Then (7, 13)   --------This is a corner case
     """
+    # Shorter runs are the weaker requirement.
+    weaken_step = -1
+
     def __init__(self, k, levels):
         super().__init__(k, levels)
         self.max_trials_required = cast(int, None)
@@ -595,6 +607,59 @@ class AtLeastKInARow(_KInARow):
         return self._potential_counts_conform_individually(counts, op.ge)
 
 
+class _Relaxation:
+    """How far a constraint's `k` may be adjusted, and what it was adjusted to.
+
+    `by` is a budget in the same units as the `k` it accompanies: the value may
+    land anywhere in [k - by, k + by]. `original_k` records what the user wrote,
+    so that re-sizing a block measures the budget from there rather than from an
+    already-widened value --- `_KInARow.desugar` returns the constraint itself
+    when its level needs no replacement, so the object a repair mutates is often
+    the one the user still holds."""
+
+    def __init__(self, by: int) -> None:
+        self.by = by
+        self.original_k = cast(Optional[int], None)
+        self.applied_k = cast(Optional[int], None)
+        # What asked for the change, for the report; None until one applies.
+        self.applied_for = cast(Optional[str], None)
+
+    def base_k(self, k: int) -> int:
+        """The value the budget is measured from: what the user wrote."""
+        return self.original_k if self.original_k is not None else k
+
+    def permits(self, k: int, candidate: int) -> bool:
+        return abs(candidate - self.base_k(k)) <= self.by
+
+    def scale(self, sustain_count: int) -> None:
+        """Follow `k` when a block sustains it. A budget counts the same
+        occurrences `k` does, so whatever multiplies one multiplies the other."""
+        self.by *= sustain_count
+        if self.original_k is not None:
+            self.original_k *= sustain_count
+        if self.applied_k is not None:
+            self.applied_k *= sustain_count
+
+    def __eq__(self, other):
+        return isinstance(other, _Relaxation) and self.__dict__ == other.__dict__
+
+    def __repr__(self):
+        return "by={}".format(self.by)
+
+
+class _CapConflict(Exception):
+    """The ExactlyK caps a coverage sizing pass needs widened, each paired with
+    its relaxation and the value it must take.
+
+    Raised only for caps that `Relax` authorized, so that the caller can repair
+    and re-run the sizing; an unauthorized cap raises `ValueError` where it is
+    found instead."""
+
+    def __init__(self, deficits) -> None:
+        super().__init__("cap conflict")
+        self.deficits = deficits
+
+
 class ExactlyK(_KInARow):
     """Requires that if the given level exists at all, it must exist in a trial
     exactly ``k`` times.
@@ -627,7 +692,75 @@ class ExactlyK(_KInARow):
     def sustain_within_block(self, sustain_count: int) -> None:
         super().sustain_within_block(sustain_count)
         self.k *= sustain_count
- 
+        if self.relaxation is not None:
+            self.relaxation.scale(sustain_count)
+
+
+#: The constraints `Relax` accepts. `ExactlyK` is repaired while the block is
+#: sized; the other two are stepped only after the solver reports no solution.
+_RELAXABLE = (ExactlyK, AtMostKInARow, AtLeastKInARow)
+
+
+def Relax(constraint: Constraint, by: int) -> Constraint:
+    """Authorizes `constraint` to be weakened by up to `by`, when it would
+    otherwise leave the design with no solution. Returns a copy to use in place
+    of the original, which is left unchanged.
+
+    `by` is a budget of steps towards the weaker requirement: a larger `k` for
+    :class:`.AtMostKInARow`, a smaller one for :class:`.AtLeastKInARow`, and
+    either direction for :class:`.ExactlyK`, where neither is weaker.
+
+    Weakening is never inferred: only a constraint passed through this function
+    is eligible, and any adjustment applied is reported as the block is built or
+    as trials are synthesized, and again alongside the results. An experiment may
+    relax one constraint.
+
+    An :class:`.ExactlyK` is repaired while the block is sized, where
+    :class:`.CoverAllCombinations` can compute the value it must take. The
+    in-a-row constraints have no such model, so they are stepped only after the
+    solver reports the design unsatisfiable.
+
+    Usage::
+
+        CrossBlock(design, crossing, [CoverAllCombinations(color, word),
+                                      Relax(ExactlyK(3, (word, 'red')), by=1)])
+        CrossBlock(design, crossing, [Relax(AtMostKInARow(2, (color, 'red')), by=1)])
+    """
+    who = "Relax"
+    if not isinstance(constraint, _RELAXABLE):
+        raise ValueError((who,
+                          "only {} can be relaxed, received {}"
+                          .format(", ".join(c.__name__ for c in _RELAXABLE),
+                                  type(constraint).__name__)))
+    # bool is a subclass of int, and `by=True` is a units mistake, not a budget.
+    if not isinstance(by, int) or isinstance(by, bool):
+        raise ValueError((who, "by must be an integer, received {}".format(by)))
+    if by <= 0:
+        raise ValueError((who, "by must be greater than 0"))
+    # A copy, so that a constraint the caller holds is not altered by wrapping
+    # it. Shallow: a deep copy would clone the level, and with it the factor,
+    # leaving the constraint pointing at a factor the design does not contain.
+    relaxed = copy(constraint)
+    relaxed.relaxation = _Relaxation(by)
+    return relaxed
+
+
+def solver_relaxable(block):
+    """The block's `Relax`-authorized constraint that the solver loop can step,
+    or None. An `ExactlyK` has no step: coverage sizing already repaired it, so
+    it never reaches the loop."""
+    for c in block.constraints:
+        if isinstance(c, _KInARow) and c.relaxation is not None and c.weaken_step:
+            return c
+    return None
+
+
+def relax_budget(constraint) -> int:
+    """Steps the loop may take. `k` must stay positive, so lowering it stops at
+    1 however large the authorized budget is."""
+    by = constraint.relaxation.by
+    return by if constraint.weaken_step > 0 else min(by, constraint.k - 1)
+
 
 class ExactlyKInARow(_KInARow):
     """Requires that if the given level exists at all, it must exist in a
@@ -1468,19 +1601,29 @@ class CoverAllCombinations(Constraint):
                 seqs.append(ct)
         return (pins, caps, seqs)
 
+    @staticmethod
+    def _cap_demand(ct, k, R_free, forced, forced_weights) -> int:
+        """The occurrences an ExactlyK's level is driven to at `k` instances:
+        each forced combination at its per-instance weight, plus one for each
+        free combination that contains the level.
+
+        Only the forced term grows with `k`, so `k` = 1 gives the floor across
+        every instance count, and a larger `k` always demands at least as much."""
+        fname, lname = ct.level.factor.name, ct.level.name
+        forced_l = sum(forced_weights.get(c, 1) for c in forced if (fname, lname) in c)
+        free_l = sum(1 for c in R_free if (fname, lname) in c)
+        return k * forced_l + free_l
+
     def _feasible_at(self, k, instance_len, R_free, forced, slots, pins, caps,
                      seq_free, sizing_block, slot_weights=None, forced_weights={}):
         """Whether coverage is achievable with `k` instances, once the statically
         modeled constraint effects are folded in jointly."""
-        # ExactlyK caps: the capped level's minimum occurrences at k instances are
-        # k * (forced occurrences per instance) + (one per required free combo).
-        # The forced term grows with k, so feasibility is NOT monotone in k —
+        # A cap's demand grows with k, so feasibility is NOT monotone in k —
         # which is why the caller scans k linearly instead of binary-searching.
+        # `caps` carries only the binding caps; ones that `Relax` authorized are
+        # reconciled by the caller against the K the scan settles on.
         for ct in caps:
-            fname, lname = ct.level.factor.name, ct.level.name
-            forced_l = sum(forced_weights.get(c, 1) for c in forced if (fname, lname) in c)
-            free_l = sum(1 for c in R_free if (fname, lname) in c)
-            if k * forced_l + free_l > ct.k:
+            if self._cap_demand(ct, k, R_free, forced, forced_weights) > ct.k:
                 return False
         if seq_free:
             return self._positional_feasible(k, instance_len, R_free, seq_free,
@@ -1585,20 +1728,25 @@ class CoverAllCombinations(Constraint):
         already are."""
         (R, forced, R_free, slots, _, slot_weights, forced_weights) = \
             self._coverage_analysis(analysis, group, exclusion_block=block)
-        # Definitive check: `required` = the capped level's occurrences at K=1
-        # (each free combo at least once + each forced combo at its per-instance
-        # weight). Adding instances only increases the forced term, so a cap
-        # below this can never be reconciled at any K.
+        binding = []
+        relaxable = []
         for ct in caps:
-            fname, lname = ct.level.factor.name, ct.level.name
-            required = (sum(1 for c in R_free if (fname, lname) in c)
-                        + sum(forced_weights.get(c, 1) for c in forced
-                              if (fname, lname) in c))
+            rl = ct.relaxation
+            if rl is None:
+                binding.append(ct)
+            else:
+                relaxable.append((ct, rl))
+        # Definitive check: a cap below the K=1 demand (see _cap_demand) can be
+        # reconciled at no instance count at all, so it fails here rather than
+        # after a scan that cannot succeed.
+        for ct in binding:
+            required = self._cap_demand(ct, 1, R_free, forced, forced_weights)
             if required > ct.k:
                 raise ValueError((who,
                                   "covering all combinations requires at least {} trials "
                                   "with '{} {}' but an ExactlyK constraint allows exactly "
-                                  "{}".format(required, fname, lname, ct.k)))
+                                  "{}".format(required, ct.level.factor.name,
+                                              ct.level.name, ct.k)))
         k_opt = self._min_instances(R_free, slots, slot_weights)
         # Scan ceiling: |R_free| instances provably suffice for the plain model
         # (see _min_instances), so twice that (or twice k_opt) leaves headroom
@@ -1606,14 +1754,85 @@ class CoverAllCombinations(Constraint):
         cap = max(len(R), k_opt) * 2
         k = k_opt
         while k <= cap:
-            if self._feasible_at(k, instance_len, R_free, forced, slots, pins, caps,
+            if self._feasible_at(k, instance_len, R_free, forced, slots, pins, binding,
                                  seq_free, block, slot_weights, forced_weights):
+                # The scan rises from the floor, so this is the smallest feasible
+                # K, and since demand grows with K it is also the K that asks the
+                # least of the relaxable caps.
+                deficits = []
+                for (ct, rl) in relaxable:
+                    demand = self._cap_demand(ct, k, R_free, forced, forced_weights)
+                    # Demand under the cap is no conflict: the model counts a
+                    # minimum, and the solver can reach the equality using the
+                    # occurrences the crossing leaves free.
+                    if demand > ct.k:
+                        deficits.append((ct, rl, demand))
+                if deficits:
+                    raise _CapConflict(deficits)
                 return k
             k += 1
         conflicting = [repr(ct) for ct in (pins + caps + seq_free)]
         raise ValueError((who,
                           "no trial count up to {} instances reconciles coverage with "
                           "the other constraints ({})".format(cap, ", ".join(conflicting))))
+
+    def reconcile_trials(self, block) -> int:
+        """`autosize_trials`, plus the widening that `Relax` authorizes.
+
+        `autosize_trials` stays a pure computation so that this can re-run it
+        after each repair: a widened cap changes the coverage model, so sizing
+        is recomputed rather than patched.
+
+        Every pass either returns or raises some cap by at least one, and every
+        budget is finite, so the authorized slack bounds the number of passes."""
+        who = "CoverAllCombinations"
+        for _ in range(self._relaxation_budget(block) + 1):
+            try:
+                total = self.autosize_trials(block)
+            except _CapConflict as conflict:
+                for (ct, rl, needed) in conflict.deficits:
+                    if not rl.permits(ct.k, needed):
+                        raise ValueError((who,
+                                          "covering all combinations requires {} trials "
+                                          "with '{} {}', but the ExactlyK constraint allows "
+                                          "{} and Relax authorizes a change of only {}"
+                                          .format(needed, ct.level.factor.name,
+                                                  ct.level.name, rl.base_k(ct.k), rl.by)))
+                    if rl.original_k is None:
+                        rl.original_k = ct.k
+                    rl.applied_k = needed
+                    rl.applied_for = repr(self)
+                    ct.k = needed
+                continue
+            self._record_relaxations(block)
+            return total
+        raise ValueError((who,
+                          "coverage sizing did not settle after applying every "
+                          "authorized relaxation"))
+
+    @staticmethod
+    def _relaxation_budget(block) -> int:
+        """Total slack `Relax` authorized across the block's ExactlyK caps."""
+        total = 0
+        for ct in block.constraints:
+            if isinstance(ct, ExactlyK) and ct.relaxation is not None:
+                total += ct.relaxation.by
+        return total
+
+    @staticmethod
+    def _record_relaxations(block) -> None:
+        """Restate the block's applied relaxations from the caps themselves, so
+        that a cap widened over several passes is reported at its final value
+        once rather than at each step."""
+        messages = []
+        for ct in block.constraints:
+            rl = ct.relaxation if isinstance(ct, ExactlyK) else None
+            if rl is not None and rl.applied_k is not None:
+                messages.append(
+                    "ExactlyK for '{} {}' relaxed from {} to {}, as {} requires."
+                    .format(ct.level.factor.name, ct.level.name,
+                            rl.original_k, rl.applied_k, rl.applied_for))
+        block.applied_relaxations = messages
 
     def sizing_message(self, total) -> str:
         """The line a block reports as it grows itself for coverage."""
