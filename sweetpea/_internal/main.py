@@ -58,7 +58,7 @@ from sweetpea._internal.constraint import (
     LatinSquare,
     Sequential,
     CoverAllCombinations,
-    solver_relaxable, relax_budget
+    solver_relaxable, relax_budget, record_concessions
 )
 from sweetpea._internal.core import SolveOutcome
 from sweetpea._internal.sampling_strategy.base import Gen
@@ -410,7 +410,7 @@ def synthesize_trials(block: Block,
         starting(sampling_strategy.class_name())
     else:
         starting(sampling_strategy)
-    sampling_result = _weaken_until_satisfiable(block, run(), run)
+    sampling_result = _concede_until_satisfiable(block, run(), run)
 
     # DW: I am not sure if I need to fix this. Need to discuss with Matthew
     raw_samples = sampling_result.samples[:samples]
@@ -443,6 +443,44 @@ def synthesize_trials(block: Block,
     return trialss
 
 
+def _concede_until_satisfiable(block, result, run):
+    """The concessions the design authorized, in order: every step of a Relax
+    budget, then one coverage factor at a time.
+
+    Applied cumulatively and never taken back, so the sequence is linear in the
+    number of concessions rather than a search over their combinations."""
+    result = _weaken_until_satisfiable(block, result, run)
+    return _drop_optional_until_satisfiable(block, result, run)
+
+
+def _drop_optional_until_satisfiable(block, result, run):
+    """Give up one optional coverage factor at a time, last in the list first,
+    resizing the block after each.
+
+    A drop is kept whether or not it helps, so what is reported is what the
+    block actually requires by the end."""
+    coverage = _droppable_coverage(block)
+    if result.outcome is not SolveOutcome.UNSATISFIABLE or coverage is None:
+        return result
+    while coverage.can_drop():
+        given_up = coverage.drop_one()
+        print("No solution; giving up {}.".format(given_up.name))
+        # The resize records the concession, from the constraint's own state.
+        block.resize_for_coverage()
+        result = run()
+        if result.samples:
+            return result
+    return result
+
+
+def _droppable_coverage(block):
+    """The block's coverage constraint that still has a factor to give up."""
+    for ct in block.constraints:
+        if isinstance(ct, CoverAllCombinations) and ct.can_drop():
+            return ct
+    return None
+
+
 def _weaken_until_satisfiable(block, result, run):
     """Step the block's one `Relax`-authorized constraint until the design has a
     solution or its budget runs out, re-solving after each step.
@@ -454,21 +492,23 @@ def _weaken_until_satisfiable(block, result, run):
         return result
     relaxation = constraint.relaxation
     written = relaxation.base_k(constraint.k)
+    relaxation.original_k = written
+    relaxation.applied_for = "the solver found no solution otherwise"
     for _ in range(relax_budget(constraint)):
         constraint.k += constraint.weaken_step
+        # Track the value as it moves, not only when this loop is the one that
+        # succeeds: a later concession can be what completes the design, and the
+        # report has to name every constraint the design ended up relying on.
+        relaxation.applied_k = constraint.k
         print("No solution; retrying with {}(k={}).".format(
             type(constraint).__name__, constraint.k))
         result = run()
         if result.samples:
-            relaxation.original_k = written
-            relaxation.applied_k = constraint.k
-            block.applied_relaxations.append(
-                "{} for '{} {}' relaxed from {} to {}, as the solver found no "
-                "solution otherwise.".format(
-                    type(constraint).__name__, constraint.level.factor.name,
-                    constraint.level.name, written, constraint.k))
+            record_concessions(block)
             return result
-    constraint.k = written
+    # The steps stay: concessions accumulate so that a later one starts from
+    # what the earlier ones bought. Nothing is written to the block's report
+    # here, so a run that never produces a design reports nothing.
     return result
 
 

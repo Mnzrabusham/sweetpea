@@ -124,59 +124,16 @@ class MultiCrossBlockRepeat(Block):
         if not all([s == self.preamble_sizes[0] for s in self.preamble_sizes]) and self.alignment == AlignmentMode.EQUAL_PREAMBLE:
             raise RuntimeError("AlignmentMode.EQUAL_PREAMBLE not allowed with different preamble sizes")
 
-        # Auto-size for CoverAllCombinations: raise the trial count to the minimum
-        # needed for coverage. Must run before trials_per_sample() is first cached.
-        for ct in self.constraints:
-            if isinstance(ct, CoverAllCombinations):
-                reported = len(self.applied_relaxations)
-                target = ct.reconcile_trials(self)
-                for message in self.applied_relaxations[reported:]:
-                    # Ahead of the trial count: the widening is what makes that
-                    # count reachable.
-                    print(message)
-                if target > 0:
-                    # Report what coverage costs, rather than the block's final
-                    # length: MinimumTrials and sustain rounding can lengthen it
-                    # further, which is not coverage's doing. A zero target means
-                    # coverage was not statically modeled, so there is no count.
-                    print(ct.sizing_message(target))
-                if target > self.min_trials:
-                    self.min_trials = target
-                    for count in self.crossing_sustain_counts:
-                        # keep min_trials a multiple of each sustain count
-                        if (self.min_trials // count) * count != self.min_trials:
-                            self.min_trials = ((self.min_trials // count) + 1) * count
-                    # A constraint's validate() (e.g. Pin's range check) may have
-                    # already cached the pre-growth trial count; invalidate it.
-                    self._trials_per_sample = None
+        # Kept so that a later resize can repeat the size-dependent work.
+        self._mode = mode
+        self._who = who
+        # The count before coverage sizing: a resize shrinks back towards this,
+        # never below what MinimumTrials or sustain rounding already require.
+        self._base_min_trials = self.min_trials
+        self._geometry_owned = cast(Optional[List[Constraint]], None)
 
-        if mode != RepeatMode.REPEAT:
-            num_trials = self.trials_per_sample()
-            for i in range(0, len(crossings)):
-                w = ((num_trials // crossing_sustain_counts[i]) - self.preamble_sizes[i] + self.crossing_sizes[i] - 1) // self.crossing_sizes[i]
-                if w != self.crossing_weights[i]:
-                    if mode == RepeatMode.EQUAL:
-                        raise RuntimeError("RepeatMode.EQUAL not allowed with different crossing+preamble sizes")
-                    self.crossing_weights[i] = w;
-
-        self._alignment_preamble = max(
-            (
-                f.first_level.window.start or 0
-                for f in self.design
-                if isinstance(f, DerivedFactor)
-                and f.has_complex_window
-            ),
-            default=0
-        )
-
-        within_block = self.get_geometry(0)
-        for ct in self.constraints:
-            ct.init_within_block(within_block)
-        # in case this block is later combined, also update constraints in `orig_constraints`
-        for ct in self.orig_constraints:
-            ct.init_within_block(within_block)
-
-        self.__validate(who)
+        self._size_for_coverage(hint=True)
+        self._apply_trial_count()
 
         # knowing that factors can be derived (and how) is useful for `RandomGen`
         derivable_factors = {}
@@ -191,6 +148,84 @@ class MultiCrossBlockRepeat(Block):
             if f in derivable_factors:
                 derivable_factors.pop(f)
         self.derivable_factors = derivable_factors
+
+    def _size_for_coverage(self, hint: bool) -> None:
+        """Size the block to what CoverAllCombinations requires, and report the
+        count.
+
+        Starts from the pre-coverage count rather than from whatever a previous
+        pass produced, so that giving a factor up can make the block shorter."""
+        from sweetpea._internal.constraint import CoverAllCombinations
+        self.min_trials = self._base_min_trials
+        self._trials_per_sample = None
+        for ct in self.constraints:
+            if isinstance(ct, CoverAllCombinations):
+                reported = len(self.applied_relaxations)
+                target = ct.reconcile_trials(self)
+                for message in self.applied_relaxations[reported:]:
+                    # Ahead of the trial count: the widening is what makes that
+                    # count reachable.
+                    print(message)
+                if target > 0:
+                    # Report what coverage costs, rather than the block's final
+                    # length: MinimumTrials and sustain rounding can lengthen it
+                    # further, which is not coverage's doing. A zero target means
+                    # coverage was not statically modeled, so there is no count.
+                    print(ct.sizing_message(target))
+                    if hint:
+                        advice = ct.optional_hint()
+                        if advice:
+                            print(advice)
+                if target > self.min_trials:
+                    self.min_trials = target
+                    for count in self.crossing_sustain_counts:
+                        # keep min_trials a multiple of each sustain count
+                        if (self.min_trials // count) * count != self.min_trials:
+                            self.min_trials = ((self.min_trials // count) + 1) * count
+                    # A constraint's validate() (e.g. Pin's range check) may have
+                    # already cached the pre-growth trial count; invalidate it.
+                    self._trials_per_sample = None
+
+    def _apply_trial_count(self) -> None:
+        """The part of construction that depends on how many trials the block
+        has. Repeated after a resize, since every piece of it is derived from
+        that count."""
+        if self._mode != RepeatMode.REPEAT:
+            num_trials = self.trials_per_sample()
+            for i in range(0, len(self.crossings)):
+                w = ((num_trials // self.crossing_sustain_counts[i]) - self.preamble_sizes[i]
+                     + self.crossing_sizes[i] - 1) // self.crossing_sizes[i]
+                if w != self.crossing_weights[i]:
+                    if self._mode == RepeatMode.EQUAL:
+                        raise RuntimeError("RepeatMode.EQUAL not allowed with different crossing+preamble sizes")
+                    self.crossing_weights[i] = w
+
+        self._alignment_preamble = max(
+            (
+                f.first_level.window.start or 0
+                for f in self.design
+                if isinstance(f, DerivedFactor)
+                and f.has_complex_window
+            ),
+            default=0
+        )
+
+        if self._geometry_owned is None:
+            # A constraint that already carries a geometry got it from an inner
+            # block, which this block does not resize; it keeps that one.
+            self._geometry_owned = [ct for ct in self.constraints + self.orig_constraints
+                                    if getattr(ct, 'within_block', None) is None]
+        within_block = self.get_geometry(0)
+        for ct in self._geometry_owned:
+            ct.set_within_block(within_block)
+
+        self.__validate(self._who)
+
+    def resize_for_coverage(self) -> None:
+        """Re-size after a coverage constraint gives a factor up. The advice on
+        what else could be given up belongs to the first report only."""
+        self._size_for_coverage(hint=False)
+        self._apply_trial_count()
 
     def __validate(self, who: str):
         self.__validate_crossing(who)

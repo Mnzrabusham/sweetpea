@@ -1130,6 +1130,7 @@ cannot hold four combinations, so the block grows to four trials.
     >>> cb = CrossBlock(design=[task, colr, size], crossing=[task],
     ...                 constraints=[CoverAllCombinations(colr, size)])
     CoverAllCombinations(colr, size) requires 4 trials.
+    Any of colr, size can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> cb.trials_per_sample()
     4
 
@@ -1166,6 +1167,7 @@ passes---nine trials---are required.
     >>> b = CrossBlock(design=[color, word], crossing=[color],
     ...                constraints=[CoverAllCombinations(color, word)])
     CoverAllCombinations(color, word) requires 9 trials.
+    Any of color, word can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> b.trials_per_sample()
     9
 
@@ -1198,6 +1200,7 @@ ruling out one `word` level leaves six combinations and six trials.
     ...                 constraints=[CoverAllCombinations(color, word),
     ...                              Exclude((word, "red"))])
     CoverAllCombinations(color, word) requires 6 trials.
+    Any of color, word can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> eb.trials_per_sample()
     6
 
@@ -1225,6 +1228,7 @@ passes.
     >>> nb = Nest(outer_block=outer, inner_block=inner,
     ...           constraints=[CoverAllCombinations(color, word)])
     CoverAllCombinations(color, word) requires 12 trials.
+    Any of color, word can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> nb.trials_per_sample()
     12
 
@@ -1271,6 +1275,7 @@ the block up to a fourth pass.
     ...                 constraints=[CoverAllCombinations(color, word),
     ...                              Pin(0, (word, "red"))])
     CoverAllCombinations(color, word) requires 12 trials.
+    Any of color, word can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> pb.trials_per_sample()
     12
 
@@ -1342,35 +1347,47 @@ reported as the block is built, so it is visible without asking for it.
     >>> tb = CrossBlock(design=design, crossing=[task],
     ...                 constraints=[CoverAllCombinations(colr, size, cue)])
     CoverAllCombinations(colr, size, cue) requires 12 trials.
+    Any of colr, size, cue can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> tb.trials_per_sample()
     12
 
-The `optional` argument names factors that need only each of their own
-levels to appear, in no particular combination. The factors given
-positionally keep the full requirement, so each factor is classified
-once. Making `cue` optional brings the same design down to four trials,
-and the report names what was made optional.
+The `optional` argument names factors that may be *given up* if the
+design turns out to have no solution. It changes nothing on its own:
+coverage still asks for every combination of every listed factor, so
+naming `cue` optional leaves the same twelve trials.
 
   .. doctest::
 
     >>> pb = CrossBlock(design=design, crossing=[task],
     ...                 constraints=[CoverAllCombinations(colr, size,
     ...                                                   optional=[cue])])
-    CoverAllCombinations(colr, size, optional=[cue]) requires 4 trials. (cue: each level appears at least once)
+    CoverAllCombinations(colr, size, optional=[cue]) requires 12 trials.
+    Any of colr, size can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> pb.trials_per_sample()
-    4
+    12
 
-All four `colr`-`size` combinations still appear and all three `cue`
-levels still appear, but the twelve three-way combinations no longer
-have to. To choose differently, move factors between the two groups and
-build the block again.
+When the solver reports that the design has no solution, factors are
+given up one at a time, the last one named first. A factor that has been
+given up needs only each of its own levels to appear, in no particular
+combination, which usually takes fewer trials --- so the block is
+re-sized after each one, and the new count is reported. Giving `cue` up
+here brings the design down to four trials: all four `colr`-`size`
+combinations still appear and all three `cue` levels still appear, but
+the twelve three-way combinations no longer have to.
 
-A factor may not be in both groups, since it cannot both require its
-combinations and give them up.
+Because factors are given up while the design is being solved, a block's
+trial count is provisional until then. Reading
+:meth:`.trials_per_sample` straight after building a block reports what
+full coverage costs, which is what the block will use if nothing has to
+be given up.
 
-Listing the same factors in two separate constraints expresses the
-same thing without the `optional` argument, since each constraint is
-sized on its own and the block takes the larger count.
+A factor may not be both required and optional, since it cannot both
+require its combinations and give them up.
+
+Listing the same factors in two separate constraints asks for the
+weaker requirement outright, without waiting for a design to fail, since
+each constraint is sized on its own and the block takes the larger
+count.
 
   .. doctest::
 
@@ -1378,6 +1395,7 @@ sized on its own and the block takes the larger count.
     ...                 constraints=[CoverAllCombinations(colr, size),
     ...                              CoverAllCombinations(cue)])
     CoverAllCombinations(colr, size) requires 4 trials.
+    Any of colr, size can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     CoverAllCombinations(cue) requires 4 trials.
     >>> sb.trials_per_sample()
     4
@@ -1409,6 +1427,7 @@ adjusts it, provided the change stays within the budget.
     ...                 constraints=[CoverAllCombinations(color, word), cap])
     ExactlyK for 'word red' relaxed from 2 to 3, as CoverAllCombinations(color, word) requires.
     CoverAllCombinations(color, word) requires 9 trials.
+    Any of color, word can be moved to `optional`, to be given up for a shorter experiment if no solution is found.
     >>> rb.trials_per_sample()
     9
 

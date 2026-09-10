@@ -413,6 +413,9 @@ class _KInARow(Constraint):
         if self.within_block is None:
             self.within_block = within_block
 
+    def set_within_block(self, within_block: BlockGeometry) -> None:
+        self.within_block = within_block
+
     def sustain_within_block(self, sustain_count: int) -> None:
         self.within_block = self.within_block.sustain(sustain_count)
  
@@ -745,6 +748,30 @@ def Relax(constraint: Constraint, by: int) -> Constraint:
     return relaxed
 
 
+def record_concessions(block) -> None:
+    """Restate every concession from the block's own state.
+
+    Derived rather than accumulated, so that a constraint changed over several
+    passes is reported at its final value, and so that no kind of concession
+    overwrites another's entries."""
+    messages = []
+    for ct in block.constraints:
+        if isinstance(ct, _KInARow) and ct.relaxation is not None \
+                and ct.relaxation.applied_k is not None:
+            rl = ct.relaxation
+            messages.append(
+                "{} for '{} {}' relaxed from {} to {}, as {}."
+                .format(type(ct).__name__, ct.level.factor.name, ct.level.name,
+                        rl.original_k, rl.applied_k, rl.applied_for))
+        elif isinstance(ct, CoverAllCombinations) and ct.dropped:
+            given_up = ct.optional[len(ct.optional) - ct.dropped:]
+            messages.append(
+                "Coverage gave up {}: each of their levels appears at least "
+                "once, as the solver found no solution otherwise."
+                .format(", ".join(str(f.name) for f in given_up)))
+    block.applied_relaxations = messages
+
+
 def solver_relaxable(block):
     """The block's `Relax`-authorized constraint that the solver loop can step,
     or None. An `ExactlyK` has no step: coverage sizing already repaired it, so
@@ -996,6 +1023,9 @@ class Pin(Constraint):
     def init_within_block(self, within_block: BlockGeometry) -> None:
         if self.within_block is None:
             self.within_block = within_block
+
+    def set_within_block(self, within_block: BlockGeometry) -> None:
+        self.within_block = within_block
 
     def sustain_within_block(self, sustain_count: int) -> None:
         if self.within_block:
@@ -1449,16 +1479,34 @@ class CoverAllCombinations(Constraint):
         self.factors = self.required + self.optional
         if self.factors == []:
             raise ValueError(who, "factor list must be non-empty")
-        # Coverage requirements, one fully-crossed combination set per group:
-        # the required factors together, then each optional factor on its own so
-        # that only its individual levels have to appear.
-        self.groups = cast(List[List[Factor]],
-                           ([required] if required else [])
-                           + [[f] for f in self.optional])
+        # How many optional factors have been given up so far.
+        self.dropped = 0
+        self.groups = self._grouping_after(0)
         # Set by Nest during construction: the inner block whose crossing determines
         # which listed factors are pinned vs. free. None for other block types, in
         # which case the attached block itself is analyzed.
         self._inner_block = cast(Optional[MultiCrossBlockRepeat], None)
+
+    def _grouping_after(self, dropped: int) -> List[List[Factor]]:
+        """Coverage requirements once `dropped` optional factors have been given
+        up, last in the list first.
+
+        A factor still kept is crossed with the others, so their combinations
+        must all appear. A factor given up forms a group of its own, which asks
+        only that each of its own levels appears somewhere."""
+        keep_count = len(self.optional) - dropped
+        kept = self.required + self.optional[:keep_count]
+        return (cast(List[List[Factor]], [kept] if kept else [])
+                + [[f] for f in self.optional[keep_count:]])
+
+    def drop_one(self) -> Factor:
+        """Give up the last optional factor still kept, and report it."""
+        self.dropped += 1
+        self.groups = self._grouping_after(self.dropped)
+        return self.optional[len(self.optional) - self.dropped]
+
+    def can_drop(self) -> bool:
+        return self.dropped < len(self.optional)
 
     # ~~~~~~~~~~~~~~ Coverage analysis (the "K" computation) ~~~~~~~~~~~~~~
 
@@ -1801,7 +1849,7 @@ class CoverAllCombinations(Constraint):
                     if rl.original_k is None:
                         rl.original_k = ct.k
                     rl.applied_k = needed
-                    rl.applied_for = repr(self)
+                    rl.applied_for = "{} requires".format(repr(self))
                     ct.k = needed
                 continue
             self._record_relaxations(block)
@@ -1821,26 +1869,31 @@ class CoverAllCombinations(Constraint):
 
     @staticmethod
     def _record_relaxations(block) -> None:
-        """Restate the block's applied relaxations from the caps themselves, so
-        that a cap widened over several passes is reported at its final value
-        once rather than at each step."""
-        messages = []
-        for ct in block.constraints:
-            rl = ct.relaxation if isinstance(ct, ExactlyK) else None
-            if rl is not None and rl.applied_k is not None:
-                messages.append(
-                    "ExactlyK for '{} {}' relaxed from {} to {}, as {} requires."
-                    .format(ct.level.factor.name, ct.level.name,
-                            rl.original_k, rl.applied_k, rl.applied_for))
-        block.applied_relaxations = messages
+        record_concessions(block)
 
     def sizing_message(self, total) -> str:
-        """The line a block reports as it grows itself for coverage."""
+        """The line a block reports as it sizes itself for coverage. Named
+        factors are the ones already given up, so nothing is listed until a drop
+        has happened."""
         msg = "{} requires {} trials.".format(repr(self), total)
-        if self.optional:
+        given_up = self.optional[len(self.optional) - self.dropped:] if self.dropped else []
+        if given_up:
             msg += " ({}: each level appears at least once)".format(
-                ", ".join(str(f.name) for f in self.optional))
+                ", ".join(str(f.name) for f in given_up))
         return msg
+
+    def optional_hint(self) -> Optional[str]:
+        """What could still be moved to `optional`, or None when there is
+        nothing worth suggesting: with one factor, giving it up leaves coverage
+        asking almost nothing.
+
+        Worded as a condition because a factor in `optional` is given up only
+        when the design has no solution, so this cannot promise fewer trials."""
+        if not self.required or len(self.factors) < 2:
+            return None
+        return ("Any of {} can be moved to `optional`, to be given up for a "
+                "shorter experiment if no solution is found."
+                .format(", ".join(str(f.name) for f in self.required)))
 
     @staticmethod
     def _k_lower_bound(R_free, slots, slot_weights=None):
@@ -1934,6 +1987,8 @@ class CoverAllCombinations(Constraint):
         c = CoverAllCombinations(*replace(self.required),
                                  optional=replace(self.optional))
         c._inner_block = self._inner_block
+        c.dropped = self.dropped
+        c.groups = c._grouping_after(c.dropped)
         return [c]
 
     def validate(self, block: Block) -> None:

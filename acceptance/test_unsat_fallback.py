@@ -98,12 +98,14 @@ def test_unwrapped_constraint_is_not_weakened(build, make):
     assert synthesize_trials(block, 1, sampling_strategy=IterateGen) == []
 
 
-def test_budget_too_small_restores_the_written_value(capsys):
+def test_budget_too_small_applies_nothing(capsys):
+    # Steps taken during the search are kept, so that a later concession starts
+    # from them, but nothing counts as applied without a design to show for it.
     block, (cap,) = _covered(
         lambda c, w: [Relax(AtLeastKInARow(7, (w, 'red')), by=1)])
     assert synthesize_trials(block, 1, sampling_strategy=IterateGen) == []
-    assert cap.k == 7
-    assert cap.relaxation.applied_k is None
+    assert cap.k == 6
+    assert block.applied_relaxations == []
     assert 'was not enough' in capsys.readouterr().out
 
 
@@ -160,3 +162,86 @@ def test_weakening_is_reported_with_the_results(capsys):
     capsys.readouterr()
     print_experiments(block, experiments)
     assert 'relaxed from 1 to 2' in capsys.readouterr().out
+
+
+# ~~~~~~~~~~~~ Giving up optional coverage factors ~~~~~~~~~~~~
+
+def _weighted(constraints, optional):
+    """`color` is 3:1 weighted and crossed, so red is three quarters of every
+    pass. Full coverage of word x cue is 12 combinations, so 3 passes of 4 = 12
+    trials holding 9 reds, which AtMostKInARow(2) cannot arrange since
+    9 > 2 * (12 - 9 + 1). Giving cue up leaves 4 combinations, one pass, 3 reds,
+    which it can."""
+    color = Factor('color', [Level('red', 3), 'green'])
+    word = Factor('word', ['w1', 'w2', 'w3', 'w4'])
+    cue = Factor('cue', ['c1', 'c2', 'c3'])
+    made = constraints(color)
+    block = CrossBlock([color, word, cue], [color],
+                       [CoverAllCombinations(word, optional=optional(word, cue))]
+                       + made)
+    return color, word, cue, block, made
+
+
+def test_optional_factor_is_given_up_and_the_block_shrinks():
+    color, word, cue, block, _ = _weighted(
+        lambda c: [AtMostKInARow(2, (c, 'red'))], lambda w, q: [q])
+    assert block.trials_per_sample() == 12
+    experiments = synthesize_trials(block, 1, sampling_strategy=IterateGen)
+    assert experiments
+    assert block.trials_per_sample() == 4
+    assert set(experiments[0]['word']) == {'w1', 'w2', 'w3', 'w4'}
+
+
+def test_giving_up_is_reported_with_the_results(capsys):
+    _, _, _, block, _ = _weighted(
+        lambda c: [AtMostKInARow(2, (c, 'red'))], lambda w, q: [q])
+    experiments = synthesize_trials(block, 1, sampling_strategy=IterateGen)
+    assert any('gave up cue' in m for m in block.applied_relaxations)
+    capsys.readouterr()
+    print_experiments(block, experiments)
+    assert 'gave up cue' in capsys.readouterr().out
+
+
+def test_last_optional_factor_is_given_up_first():
+    colr = Factor('colr', ['red', 'green'])
+    size = Factor('size', ['big', 'small'])
+    cue = Factor('cue', ['c1', 'c2'])
+    coverage = CoverAllCombinations(colr, optional=[size, cue])
+    assert coverage.drop_one() is cue
+    assert coverage.drop_one() is size
+    assert not coverage.can_drop()
+
+
+def test_relax_and_giving_up_apply_in_order():
+    # AtMostKInARow(1) needs k >= 3 at twelve trials, so one Relax step is not
+    # enough on its own; giving cue up as well brings the block within reach.
+    cap = []
+
+    def make(color):
+        cap.append(Relax(AtMostKInARow(1, (color, 'red')), by=1))
+        return cap
+
+    _, _, _, block, _ = _weighted(make, lambda w, q: [q])
+    experiments = synthesize_trials(block, 1, sampling_strategy=IterateGen)
+    assert experiments
+    assert cap[0].relaxation.applied_k == 2
+    assert block.trials_per_sample() == 4
+    reported = ' '.join(block.applied_relaxations)
+    assert 'AtMostKInARow' in reported
+    assert 'gave up cue' in reported
+
+
+def test_nothing_left_to_give_up_returns_no_sequences():
+    # AtLeastKInARow(5) cannot be met at either size, and there is only one
+    # factor to give up.
+    colors = ['red', 'green', 'blue']
+    color = Factor('color', colors)
+    word = Factor('word', colors)
+    congruency = Factor('congruency', [
+        DerivedLevel('con', WithinTrial(lambda c, w: c == w, [color, word])),
+        DerivedLevel('incon', WithinTrial(lambda c, w: c != w, [color, word])),
+    ])
+    block = CrossBlock([congruency, color, word], [congruency, color],
+                       [CoverAllCombinations(color, optional=[word]),
+                        AtLeastKInARow(5, (word, 'red'))])
+    assert synthesize_trials(block, 1, sampling_strategy=IterateGen) == []

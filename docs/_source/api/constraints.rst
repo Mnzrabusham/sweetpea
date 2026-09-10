@@ -177,12 +177,11 @@ Constraints
 
               Constrains an experiment so that its trials collectively
               include every realizable combination of the levels of
-              `factors` at least once, plus a weaker requirement for
-              each factor named in `optional`. A factor that is left
-              out of a crossing is otherwise assigned freely by the
-              solver, so nothing normally guarantees that a particular
-              combination ever appears; this constraint coordinates
-              those free choices.
+              `factors` and of `optional` at least once. A factor that
+              is left out of a crossing is otherwise assigned freely by
+              the solver, so nothing normally guarantees that a
+              particular combination ever appears; this constraint
+              coordinates those free choices.
 
               Unlike most constraints, :class:`CoverAllCombinations`
               can increase the number of trials: the count needed for
@@ -207,17 +206,20 @@ Constraints
               weighted levels elsewhere in the crossing are supported,
               and they change the trial count accordingly.
 
-              The two groups carry different guarantees. The
-              positional `factors` must appear in combination with one
-              another---every combination of their levels. A factor
-              named in `optional` needs only each of its own levels to
-              appear somewhere, in no particular combination. Since the
-              required set is the product of the levels involved,
-              moving a factor to `optional` trades coverage for a
-              shorter experiment. A factor may not be in both groups.
+              The two groups differ in what may be given up, not in
+              what is required to begin with. Every listed factor must
+              appear in combination with the others. When the solver
+              reports that the design has no solution, the factors named
+              in `optional` are given up one at a time, the last one
+              first: a factor that has been given up needs only each of
+              its own levels to appear, in no particular combination,
+              and the block is re-sized to the shorter experiment that
+              leaves. A factor may not be in both groups.
 
-              The number of trials required is printed as the block is
-              built, along with any factors that were made optional.
+              Because factors are given up while the design is being
+              solved, the trial count is provisional until then. The
+              count is printed as the block is built and again whenever
+              it changes, naming the factors given up so far.
 
               See :ref:`Covering All Combinations <covering-all-combinations>`
               for more information.
@@ -226,6 +228,8 @@ Constraints
                               combination with one another
               :type factors: Factor
               :param optional: further factors the constraint governs,
+                               which may be given up---last one first---
+                               when the design has no solution, leaving
                                each needing only its own levels to
                                appear rather than its combinations
               :type optional: List[Factor]

@@ -304,6 +304,12 @@ def _trio():
     return colr, size, cue, task
 
 
+def _coverage_of(block):
+    """The desugared constraint the block sizes itself from."""
+    return next(c for c in block.constraints
+                if isinstance(c, CoverAllCombinations))
+
+
 def _trio_block(colr, size, cue, task, required=None, **kw):
     """All three factors required by default, which is full coverage."""
     required = [colr, size, cue] if required is None else required
@@ -317,10 +323,20 @@ def test_no_optional_keeps_full_coverage(kw):
     assert _trio_block(colr, size, cue, task, **kw).trials_per_sample() == 12
 
 
-def test_optional_reduces_trials():
+def test_optional_is_covered_until_it_is_given_up():
+    # Naming cue optional does not give it up; coverage still asks for every
+    # colr-size-cue combination, which is the full 12 trials.
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
+    assert block.trials_per_sample() == 12
+
+
+def test_giving_up_an_optional_factor_shortens_the_block():
     # colr x size needs 2 passes and cue's 3 levels need 2, so K = 2.
     colr, size, cue, task = _trio()
     block = _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
+    _coverage_of(block).drop_one()
+    block.resize_for_coverage()
     assert block.trials_per_sample() == 4
 
 
@@ -328,14 +344,24 @@ def test_optional_ignores_duplicates():
     colr, size, cue, task = _trio()
     block = _trio_block(colr, size, cue, task, required=[colr, size],
                         optional=[cue, cue])
+    coverage = _coverage_of(block)
+    assert coverage.optional == [cue]
+    # One factor listed once, so one drop exhausts what can be given up.
+    coverage.drop_one()
+    assert not coverage.can_drop()
+    block.resize_for_coverage()
     assert block.trials_per_sample() == 4
 
 
 def test_optional_crossed_factor_is_harmless():
-    # `task` is crossed, so its group is satisfied by every pass.
+    # `task` is crossed, so once given up its group is satisfied by every pass.
     colr, size, cue, task = _trio()
     block = _trio_block(colr, size, cue, task, required=[colr, size],
                         optional=[task, cue])
+    coverage = _coverage_of(block)
+    while coverage.can_drop():
+        coverage.drop_one()
+    block.resize_for_coverage()
     assert block.trials_per_sample() == 4
 
 
@@ -408,9 +434,13 @@ def test_optional_in_nest():
     # own 8 word-cue combinations, so K = 8 over passes of 6.
     full = Nest(outer, inner, [CoverAllCombinations(color, word, cue)])
     assert full.trials_per_sample() == 48
-    # Making cue optional leaves the 6 free color-word pairs over 3 slots: K = 2.
+    # Naming cue optional changes nothing until it is given up.
     fewer = Nest(outer, inner,
                  [CoverAllCombinations(color, word, optional=[cue])])
+    assert fewer.trials_per_sample() == 48
+    # Given up, the 6 free color-word pairs over 3 slots leave K = 2.
+    _coverage_of(fewer).drop_one()
+    fewer.resize_for_coverage()
     assert fewer.trials_per_sample() == 12
 
 
@@ -439,19 +469,63 @@ def test_reports_the_count_under_full_coverage(capsys):
     assert 'each level appears' not in out
 
 
-def test_reports_the_count_and_optional_factors(capsys):
+def test_reports_the_full_count_before_anything_is_given_up(capsys):
     colr, size, cue, task = _trio()
     _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
     out = capsys.readouterr().out
-    assert ('CoverAllCombinations(colr, size, optional=[cue]) requires 4 trials. '
-            '(cue: each level appears at least once)') in out
+    assert 'CoverAllCombinations(colr, size, optional=[cue]) requires 12 trials.' in out
+    # Nothing has been given up yet, so nothing is named as given up.
+    assert 'each level appears' not in out
 
 
-def test_reports_every_optional_factor(capsys):
+def test_reports_factors_once_they_are_given_up(capsys):
     colr, size, cue, task = _trio()
-    _trio_block(colr, size, cue, task, required=[colr], optional=[size, cue])
+    block = _trio_block(colr, size, cue, task, required=[colr], optional=[size, cue])
+    coverage = _coverage_of(block)
+    while coverage.can_drop():
+        coverage.drop_one()
+    capsys.readouterr()
+    block.resize_for_coverage()
+    assert '(size, cue: each level appears at least once)' in capsys.readouterr().out
+
+
+# ~~~~~~~~~~~~ The hint about what else could be given up ~~~~~~~~~~~~
+
+def test_hint_names_the_required_factors(capsys):
+    colr, size, cue, task = _trio()
+    _trio_block(colr, size, cue, task)
+    assert 'Any of colr, size, cue can be moved to `optional`' in capsys.readouterr().out
+
+
+def test_hint_names_only_what_is_still_required(capsys):
+    colr, size, cue, task = _trio()
+    _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
     out = capsys.readouterr().out
-    assert '(size, cue: each level appears at least once)' in out
+    assert 'Any of colr, size can be moved to `optional`' in out
+
+
+def test_no_hint_when_nothing_is_left_to_move(capsys):
+    colr, size, cue, task = _trio()
+    _trio_block(colr, size, cue, task, required=[], optional=[cue])
+    assert 'can be moved to `optional`' not in capsys.readouterr().out
+
+
+def test_no_hint_for_a_single_factor(capsys):
+    # Giving up the only factor leaves coverage asking almost nothing, so it is
+    # not worth suggesting.
+    colr, size, cue, task = _trio()
+    CrossBlock(design=[task, colr], crossing=[task],
+               constraints=[CoverAllCombinations(colr)])
+    assert 'can be moved to `optional`' not in capsys.readouterr().out
+
+
+def test_hint_is_not_repeated_after_a_drop(capsys):
+    colr, size, cue, task = _trio()
+    block = _trio_block(colr, size, cue, task, required=[colr, size], optional=[cue])
+    _coverage_of(block).drop_one()
+    capsys.readouterr()
+    block.resize_for_coverage()
+    assert 'can be moved to `optional`' not in capsys.readouterr().out
 
 
 def test_reports_each_constraint_separately(capsys):
