@@ -178,10 +178,11 @@ Constraints
               Constrains an experiment so that its trials collectively
               include every realizable combination of the levels of
               `factors` and of `optional` at least once. A factor that
-              is left out of a crossing is otherwise assigned freely by
-              the solver, so nothing normally guarantees that a
-              particular combination ever appears; this constraint
-              coordinates those free choices.
+              is left out of a crossing is assigned by the solver
+              subject only to whatever other constraints apply, so
+              nothing otherwise guarantees that a particular
+              combination ever appears; this constraint supplies that
+              guarantee.
 
               Unlike most constraints, :class:`CoverAllCombinations`
               can increase the number of trials: the count needed for

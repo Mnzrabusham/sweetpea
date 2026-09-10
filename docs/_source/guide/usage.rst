@@ -1086,9 +1086,9 @@ some combinations may never show up at all.
 The :class:`.CoverAllCombinations` constraint asks for a weaker
 guarantee than crossing: over the experiment as a whole, every
 combination of the listed factors must appear at least once.
-Individual trials still vary freely, and the design itself implies no
-particular number of trials, so SweetPea computes how many trials
-coverage needs and grows the block to fit.
+It says nothing about which trial holds which combination, and the
+design itself implies no particular number of trials, so SweetPea
+computes how many trials coverage needs and grows the block to fit.
 
 A Free-Factor Example
 ^^^^^^^^^^^^^^^^^^^^^
